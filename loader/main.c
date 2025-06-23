@@ -17,6 +17,9 @@
 #include <AL/alext.h>
 #include <AL/efx.h>
 
+#include <SLES/OpenSLES.h>
+#include <SLES/OpenSLES_Android.h>
+
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netdb.h>
@@ -32,6 +35,7 @@
 #include <pthread.h>
 #include <wchar.h>
 #include <wctype.h>
+#include <locale.h>
 
 #include <math.h>
 #include <math_neon.h>
@@ -51,10 +55,20 @@
 
 #include "openal_patch.h"
 
+#define STBI_MALLOC vglMalloc
+#define STBI_REALLOC vglRealloc
+#define STBI_FREE vglFree
 #define STB_IMAGE_IMPLEMENTATION
 #define STB_ONLY_PNG
 #include "stb_image.h"
 
+extern int trophies_init();
+extern void patch_trophies();
+extern void audio_player_play(char *path, int loop);
+extern void audio_player_stop();
+extern void audio_player_pause();
+extern void audio_player_resume();
+extern int audio_player_is_playing();
 extern int is_gamepad_connected(int id);
 extern void send_post_request(const char *url, const char *data);
 extern void mem_profiler(void *framebuf);
@@ -70,16 +84,18 @@ extern char *get_url;
 extern unsigned _newlib_heap_size;
 
 int disableObjectsArray = 0;
+int uncached_mem = 0;
+int double_buffering = 0;
 int forceGL1 = 0;
 int forceSplashSkip = 0;
-int forceWinMode = 0;
+int platTarget = 0;
 int forceBilinear = 0;
-int compressTextures = 0;
 int has_net = 0;
 extern int maximizeMem;
 int debugShaders = 0;
 int squeeze_mem = 0;
 int debugMode = 0;
+int disableAudio = 0;
 int ime_active = 0;
 int msg_active = 0;
 int msg_index = 0;
@@ -88,21 +104,29 @@ int post_active = 0;
 int post_index = 0;
 int get_active = 0;
 int get_index = 0;
+int setup_ended = 0;
+
+int deltarune_hack = 0;
 
 extern int (*YYGetInt32) (void *args, int idx);
 void (*Function_Add)(const char *name, intptr_t func, int argc, char ret);
 int (*Java_com_yoyogames_runner_RunnerJNILib_CreateVersionDSMap) (void *env, int a2, int sdk_ver, char *release_version, char *model, char *device, char *manufacturer, char *cpu_abi, char *cpu_abi2, char *bootloader, char *board, char *version, char *region, char *version_name, int has_keyboard);
+int (*Java_com_yoyogames_runner_RunnerJNILib_TouchEvent) (void *env, int a2, int type, int id, float x, float y);
 float (*Audio_GetTrackPos) (int id);
 uint8_t *g_fNoAudio;
 int64_t *g_GML_DeltaTime;
 uint32_t *g_IOFrameCount;
+char **g_pWorkingDirectory;
+int *g_TextureScale;
 
 double jni_double = 0.0f;
 GLuint main_fb, main_tex = 0xDEADBEEF;
 int is_portrait = 0;
 
 char data_path[256];
+char data_path_root[256];
 char apk_path[256];
+char gxp_path[256];
 
 void patch_gamepad();
 void GamePadUpdate();
@@ -138,14 +162,17 @@ void loadConfig(const char *game) {
 		while (EOF != fscanf(config, "%[^=]=%d\n", buffer, &value)) {
 			if (strcmp("forceGLES1", buffer) == 0) forceGL1 = value;
 			else if (strcmp("forceBilinear", buffer) == 0) forceBilinear = value;
-			else if (strcmp("winMode", buffer) == 0) forceWinMode = value;
+			else if (strcmp("winMode", buffer) == 0) platTarget = value ? 1 : 0; // Retrocompatibility
+			else if (strcmp("platTarget", buffer) == 0) platTarget = value;
 			else if (strcmp("debugShaders", buffer) == 0) debugShaders = value;
-			else if (strcmp("compressTextures", buffer) == 0) compressTextures = value;
 			else if (strcmp("debugMode", buffer) == 0) debugMode = value;
 			else if (strcmp("noSplash", buffer) == 0) forceSplashSkip = value;
 			else if (strcmp("maximizeMem", buffer) == 0) maximizeMem = value;
 			else if (strcmp("netSupport", buffer) == 0) has_net = value;
 			else if (strcmp("squeezeMem", buffer) == 0) squeeze_mem = value;
+			else if (strcmp("disableAudio", buffer) == 0) disableAudio = value;
+			else if (strcmp("uncachedMem", buffer) == 0) uncached_mem = value;
+			else if (strcmp("doubleBuffering", buffer) == 0) double_buffering = value;
 		}
 		fclose(config);
 	}
@@ -154,15 +181,12 @@ void loadConfig(const char *game) {
 extern void *GetPlatformInstance;
 
 static int __stack_chk_guard_fake = 0x42424242;
-ALCdevice *ALDevice;
-ALvoid *ALContext;
-
 static char fake_vm[0x1000];
 char fake_env[0x1000];
 
 unsigned int _pthread_stack_default_user = 1 * 1024 * 1024;
 
-so_module yoyoloader_mod;
+so_module yoyoloader_mod, cpp_mod;
 
 void *__wrap_memcpy(void *dest, const void *src, size_t n) {
 	return sceClibMemcpy(dest, src, n);
@@ -236,7 +260,7 @@ int scandir_hook(const char *dir, struct android_dirent ***namelist,
 		android_current->d_type = SCE_S_ISDIR(current->d_stat.st_mode) ? 4 : 8;
 
 		if (! use_it) {	
-			use_it = (*selector) (android_current);
+			use_it = (*selector)(android_current);
 			/* The selector function might have changed errno.
 			* It was zero before and it need to be again to make
 			* the latter tests work.  */
@@ -257,18 +281,18 @@ int scandir_hook(const char *dir, struct android_dirent ***namelist,
 					names_size = 10;
 				else
 					names_size *= 2;
-				new = (struct android_dirent **) vglRealloc (names, names_size * sizeof (struct android_dirent *));
+				new = (struct android_dirent **)vglRealloc(names, names_size * sizeof(struct android_dirent*));
 				if (new == NULL)
 					break;
 				names = new;
 			}
 
 			dsize = &android_current->d_name[256+1] - (char*)android_current;
-			vnew = (struct android_dirent *) vglMalloc (dsize);
+			vnew = (struct android_dirent*)vglMalloc(dsize);
 			if (vnew == NULL)
 				break;
 
-			names[pos++] = (struct android_dirent *) sceClibMemcpy (vnew, android_current, dsize);
+			names[pos++] = (struct android_dirent*)sceClibMemcpy(vnew, android_current, dsize);
 		}
 	}
 
@@ -276,8 +300,8 @@ int scandir_hook(const char *dir, struct android_dirent ***namelist,
 		//save = errno;
 		closedir (dp);
 		while (pos > 0)
-			vglFree (names[--pos]);
-		vglFree (names);
+			vglFree(names[--pos]);
+		vglFree(names);
 		//__set_errno (save);
 		return -1;
 	}
@@ -287,7 +311,7 @@ int scandir_hook(const char *dir, struct android_dirent ***namelist,
 
 	/* Sort the list if we have a comparison function to sort with.  */
 	if (compar != NULL)
-		qsort (names, pos, sizeof (struct android_dirent *), (__compar_fn_t) compar);
+		qsort (names, pos, sizeof(struct android_dirent*), (__compar_fn_t) compar);
 	*namelist = names;
 	return pos;
 }
@@ -330,8 +354,63 @@ int ret1(void) {
 	return 1;
 }
 
+int pthread_rwlock_init_fake(pthread_rwlock_t **uid, const pthread_rwlockattr_t *attr) {
+	pthread_rwlock_t *l = vglCalloc(1, sizeof(pthread_rwlock_t));
+	if (!l)
+		return -1;
+	
+	int ret = pthread_rwlock_init(l, attr);
+	if (ret < 0) {
+		vglFree(l);
+		return -1;
+	}
+
+	*uid = l;
+
+	return 0;
+}
+
+int pthread_rwlock_destroy_fake(pthread_rwlock_t **uid) {
+	if (uid && *uid) {
+		pthread_rwlock_destroy(*uid);
+		vglFree(*uid);
+		*uid = NULL;
+	}
+	return 0;
+}
+
+int pthread_rwlock_rdlock_fake(pthread_rwlock_t **uid) {
+	int ret = 0;
+	if (!*uid) {
+		ret = pthread_rwlock_init_fake(uid, NULL);
+	}
+	if (ret < 0)
+		return ret;
+	return pthread_rwlock_rdlock(*uid);
+}
+
+int pthread_rwlock_wrlock_fake(pthread_rwlock_t **uid) {
+	int ret = 0;
+	if (!*uid) {
+		ret = pthread_rwlock_init_fake(uid, NULL);
+	}
+	if (ret < 0)
+		return ret;
+	return pthread_rwlock_wrlock(*uid);
+}
+
+int pthread_rwlock_unlock_fake(pthread_rwlock_t **uid) {
+	int ret = 0;
+	if (!*uid) {
+		ret = pthread_rwlock_init_fake(uid, NULL);
+	}
+	if (ret < 0)
+		return ret;
+	return pthread_rwlock_unlock(*uid);
+}
+
 int pthread_mutex_init_fake(pthread_mutex_t **uid, const pthread_mutexattr_t *mutexattr) {
-	pthread_mutex_t *m = calloc(1, sizeof(pthread_mutex_t));
+	pthread_mutex_t *m = vglCalloc(1, sizeof(pthread_mutex_t));
 	if (!m)
 		return -1;
 
@@ -340,7 +419,7 @@ int pthread_mutex_init_fake(pthread_mutex_t **uid, const pthread_mutexattr_t *mu
 
 	int ret = pthread_mutex_init(m, mutexattr);
 	if (ret < 0) {
-		free(m);
+		vglFree(m);
 		return -1;
 	}
 
@@ -352,7 +431,7 @@ int pthread_mutex_init_fake(pthread_mutex_t **uid, const pthread_mutexattr_t *mu
 int pthread_mutex_destroy_fake(pthread_mutex_t **uid) {
 	if (uid && *uid && (uintptr_t)*uid > 0x8000) {
 		pthread_mutex_destroy(*uid);
-		free(*uid);
+		vglFree(*uid);
 		*uid = NULL;
 	}
 	return 0;
@@ -403,7 +482,7 @@ int pthread_mutex_unlock_fake(pthread_mutex_t **uid) {
 }
 
 int pthread_cond_init_fake(pthread_cond_t **cnd, const int *condattr) {
-	pthread_cond_t *c = calloc(1, sizeof(pthread_cond_t));
+	pthread_cond_t *c = vglCalloc(1, sizeof(pthread_cond_t));
 	if (!c)
 		return -1;
 
@@ -411,7 +490,7 @@ int pthread_cond_init_fake(pthread_cond_t **cnd, const int *condattr) {
 
 	int ret = pthread_cond_init(c, NULL);
 	if (ret < 0) {
-		free(c);
+		vglFree(c);
 		return -1;
 	}
 
@@ -439,7 +518,7 @@ int pthread_cond_signal_fake(pthread_cond_t **cnd) {
 int pthread_cond_destroy_fake(pthread_cond_t **cnd) {
 	if (cnd && *cnd) {
 		pthread_cond_destroy(*cnd);
-		free(*cnd);
+		vglFree(*cnd);
 		*cnd = NULL;
 	}
 	return 0;
@@ -462,7 +541,11 @@ int pthread_cond_timedwait_fake(pthread_cond_t **cnd, pthread_mutex_t **mtx, con
 }
 
 int pthread_create_fake(pthread_t *thread, const void *unused, void *entry, void *arg) {
-	return pthread_create(thread, NULL, entry, arg);
+	pthread_t t;
+	pthread_attr_t attr;
+	pthread_attr_init(&attr);
+	pthread_attr_setstacksize(&attr, 1024 * 1024);
+	return pthread_create(thread, &attr, entry, arg);
 }
 
 int pthread_once_fake(volatile int *once_control, void (*init_routine)(void)) {
@@ -500,26 +583,19 @@ int DebugPrintf(int *target, const char *fmt, ...) {
 	return 0;
 }
 
-enum {
-	TOUCH_DOWN,
-	TOUCH_UP,
-	TOUCH_MOVE
-};
-
 void main_loop() {
 	int (*Java_com_yoyogames_runner_RunnerJNILib_Process) (void *env, int a2, int w, int h, float accel_x, float accel_y, float accel_z, int keypad_open, int orientation, float refresh_rate) = (void *)so_symbol(&yoyoloader_mod, "Java_com_yoyogames_runner_RunnerJNILib_Process");
-	int (*Java_com_yoyogames_runner_RunnerJNILib_TouchEvent) (void *env, int a2, int type, int id, float x, float y) = (void *)so_symbol(&yoyoloader_mod, "Java_com_yoyogames_runner_RunnerJNILib_TouchEvent");
 	int (*Java_com_yoyogames_runner_RunnerJNILib_InputResult) (void *env, int a2, char *string, int state, int id) = (void *)so_symbol(&yoyoloader_mod, "Java_com_yoyogames_runner_RunnerJNILib_InputResult");
 	int (*Java_com_yoyogames_runner_RunnerJNILib_HttpResult) (void *env, int a2, void *result, int responde_code, int id, char *url, void *header) = (void *)so_symbol(&yoyoloader_mod, "Java_com_yoyogames_runner_RunnerJNILib_HttpResult");
 	int (*Java_com_yoyogames_runner_RunnerJNILib_canFlip) (void) = (void *)so_symbol(&yoyoloader_mod, "Java_com_yoyogames_runner_RunnerJNILib_canFlip");
 	g_IOFrameCount = (uint32_t *)so_symbol(&yoyoloader_mod, "g_IOFrameCount");
 	g_GML_DeltaTime = (int64_t *)so_symbol(&yoyoloader_mod, "g_GML_DeltaTime");
-	g_fNoAudio = (uint8_t *)so_symbol(&yoyoloader_mod, "g_fNoAudio");
 	Audio_GetTrackPos = (void *)so_symbol(&yoyoloader_mod, "_Z17Audio_GetTrackPosi");
 	
 	int lastX[SCE_TOUCH_MAX_REPORT] = {-1, -1, -1, -1, -1, -1, -1, -1};
 	int lastY[SCE_TOUCH_MAX_REPORT] = {-1, -1, -1, -1, -1, -1, -1, -1};
 	
+	setup_ended = 1;
 	glReleaseShaderCompiler();
 	for (;;) {
 		if (post_active) {
@@ -676,14 +752,262 @@ void __stack_chk_fail_fake() {
 }
 
 double GetPlatform() {
-	return forceWinMode ? 0.0f : 4.0f;
+	switch (platTarget) {
+	case 1: // Windows
+		return 0.0f;
+	case 2: // PS4
+		return 14.0f;
+	default: // Android
+		return 4.0f;
+	}
+}
+
+uint32_t *(*ReadPNGFile) (void *a1, int a2, int *a3, int *a4, int a5);
+void (*FreePNGFile) ();
+void (*InvalidateTextureState) ();
+
+void LoadTextureFromPNG_generic(uint32_t arg1, uint32_t arg2, uint32_t *flags, uint32_t *tex_id, uint32_t *texture) {
+	int width, height;
+	uint32_t *data = ReadPNGFile(arg1 , arg2, &width, &height, (*flags & 2) == 0);
+	if (data) {
+		InvalidateTextureState();
+		glGenTextures(1, tex_id);
+		glBindTexture(GL_TEXTURE_2D, *tex_id);
+		if (width == 2 && height == 1) {
+			if (data[0] == 0xFFBEADDE) {
+				uint32_t *ext_data;
+				uint32_t idx = (data[1] << 8) >> 8;
+				char fname[256];
+#ifdef STANDALONE_MODE
+				sprintf(fname, "app0:assets/%u.pvr", idx);
+#else
+				sprintf(fname, "%s%u.pvr", data_path, idx);
+#endif
+				FILE *f = fopen(fname, "rb");
+				if (f) {
+					debugPrintf("Loading externalized texture %s (Raw ID: 0x%X)\n", fname, data[1]);
+					fseek(f, 0, SEEK_END);
+					uint32_t size = ftell(f) - 0x34;
+					uint32_t metadata_size;
+					fseek(f, 0x08, SEEK_SET);
+					uint64_t format;
+					fread(&format, 1, 8, f);
+					fseek(f, 0x18, SEEK_SET);
+					fread(&height, 1, 4, f);
+					fread(&width, 1, 4, f);
+					fseek(f, 0x30, SEEK_SET);
+					fread(&metadata_size, 1, 4, f);
+					size -= metadata_size;
+					ext_data = vglMalloc(size);
+					fseek(f, metadata_size, SEEK_CUR);
+					fread(ext_data, 1, size, f);
+					fclose(f);
+					switch (format) {
+					case 0x00:
+						glCompressedTexImage2D(GL_TEXTURE_2D, 0, GL_COMPRESSED_RGB_PVRTC_2BPPV1_IMG, width, height, 0, size, ext_data);
+						break;
+					case 0x01:
+						glCompressedTexImage2D(GL_TEXTURE_2D, 0, GL_COMPRESSED_RGBA_PVRTC_2BPPV1_IMG, width, height, 0, size, ext_data);
+						break;
+					case 0x02:
+						glCompressedTexImage2D(GL_TEXTURE_2D, 0, GL_COMPRESSED_RGB_PVRTC_4BPPV1_IMG, width, height, 0, size, ext_data);
+						break;
+					case 0x03:
+						glCompressedTexImage2D(GL_TEXTURE_2D, 0, GL_COMPRESSED_RGBA_PVRTC_4BPPV1_IMG, width, height, 0, size, ext_data);
+						break;
+					case 0x04:
+						glCompressedTexImage2D(GL_TEXTURE_2D, 0, GL_COMPRESSED_RGBA_PVRTC_2BPPV2_IMG, width, height, 0, size, ext_data);
+						break;
+					case 0x05:
+						glCompressedTexImage2D(GL_TEXTURE_2D, 0, GL_COMPRESSED_RGBA_PVRTC_4BPPV2_IMG, width, height, 0, size, ext_data);
+						break;
+					case 0x06:
+						glCompressedTexImage2D(GL_TEXTURE_2D, 0, GL_ETC1_RGB8_OES, width, height, 0, size, ext_data);
+						break;
+					case 0x07:
+						glCompressedTexImage2D(GL_TEXTURE_2D, 0, GL_COMPRESSED_RGBA_S3TC_DXT1_EXT, width, height, 0, size, ext_data);
+						break;
+					case 0x09:
+						glCompressedTexImage2D(GL_TEXTURE_2D, 0, GL_COMPRESSED_RGBA_S3TC_DXT3_EXT, width, height, 0, size, ext_data);
+						break;
+					case 0x0B:
+						if (metadata_size == 4) { // Load DXT5 as pre-swizzled
+							glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 8, 8, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+							SceGxmTexture *gxm_tex = vglGetGxmTexture(GL_TEXTURE_2D);
+							vglFree(vglGetTexDataPointer(GL_TEXTURE_2D));
+							void *tex_data = vglForceAlloc(size);
+							sceClibMemcpy(tex_data, ext_data, size);
+							sceGxmTextureInitSwizzledArbitrary(gxm_tex, tex_data, SCE_GXM_TEXTURE_FORMAT_UBC3_ABGR, width, height, 0);
+							vglOverloadTexDataPointer(GL_TEXTURE_2D, tex_data);
+						} else
+							glCompressedTexImage2D(GL_TEXTURE_2D, 0, GL_COMPRESSED_RGBA_S3TC_DXT5_EXT, width, height, 0, size, ext_data);
+						break;
+					default:
+						debugPrintf("Unsupported externalized texture format (0x%llX).\n", format);
+						break;
+					}
+				} else {
+					debugPrintf("Loading externalized texture %s (Raw ID: 0x%X).\n", fname, data[1]);
+#ifdef STANDALONE_MODE
+					sprintf(fname, "app0:assets/%u.png", idx);
+#else
+					sprintf(fname, "%s%u.png", data_path, idx);
+#endif
+					ext_data = stbi_load(fname, &width, &height, NULL, 4);
+					glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, ext_data);
+				}
+				vglFree(ext_data);
+			} else {
+				glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
+			}
+		} else {
+			glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
+		}
+		*flags = *flags | 0x40;
+		FreePNGFile();
+		texture[0] = 0x06;
+		if (flags != &texture[2]) {
+			texture[1] = width;
+			texture[2] = height;
+		} else {
+			texture[1] = ((width * *g_TextureScale - 1) | texture[1] & 0xFFFFE000) & 0xFC001FFF | ((height * *g_TextureScale - 1) << 13);
+		}
+		debugPrintf("Texture size: %dx%d\n", width, height);
+	} else {
+		debugPrintf("ERROR: Failed to load a PNG texture!\n");
+	}
+}
+
+void LoadTextureFromPNG_1(uint32_t *texture, int has_mips) {
+	LoadTextureFromPNG_generic(texture[23], texture[24], &texture[5], &texture[6], texture);
+}
+
+void LoadTextureFromPNG_2(uint32_t *texture, int has_mips) {
+	LoadTextureFromPNG_generic(texture[11], texture[12], &texture[4], &texture[5], texture);
+}
+
+void LoadTextureFromPNG_3(uint32_t *texture) {
+	LoadTextureFromPNG_generic(texture[9], texture[10], &texture[2], &texture[3], texture);
+}
+
+void LoadTextureFromPNG_4(uint32_t *texture) {
+	LoadTextureFromPNG_generic(texture[8], texture[9], &texture[2], &texture[3], texture);
+}
+
+int image_preload_idx = 0;
+uint32_t png_get_IHDR_hook(uint32_t *png_ptr, uint32_t *info_ptr, uint32_t *width, uint32_t *height, int *bit_depth, int *color_type, int *interlace_type, int *compression_type, int *filter_type) {
+	if (!png_ptr || !info_ptr || !width || !height)
+		return 0;
+	
+	*width = info_ptr[0];
+	*height = info_ptr[1];
+
+	if (bit_depth)
+		*bit_depth = *((uint8_t *)info_ptr + 24);
+
+	if (color_type)
+		*color_type = *((uint8_t *)info_ptr + 25);
+
+	if (compression_type)
+		*compression_type = *((uint8_t *)info_ptr + 26);
+
+	if (filter_type)
+		*filter_type = *((uint8_t *)info_ptr + 27);
+
+	if (interlace_type)
+		*interlace_type = *((uint8_t *)info_ptr + 28);
+
+	if (!setup_ended && *width == 2 && *height == 1) {
+		char fname[256];
+#ifdef STANDALONE_MODE
+		sprintf(fname, "app0:assets/%d.pvr", image_preload_idx);
+#else
+		sprintf(fname, "%s%d.pvr", data_path, image_preload_idx);
+#endif
+		FILE *f = fopen(fname, "rb");
+		if (f) {
+			fseek(f, 0x18, SEEK_SET);
+			fread(height, 1, 4, f);
+			fread(width, 1, 4, f);
+			fclose(f);
+		} else {
+#ifdef STANDALONE_MODE
+			sprintf(fname, "app0:assets/%d.pvr", image_preload_idx);
+#else
+			sprintf(fname, "%s%d.png", data_path, image_preload_idx);
+#endif
+			int dummy;
+			stbi_info(fname, width, height, &dummy);
+		}
+		image_preload_idx++;
+	}
+	return 1;
+}
+
+void SetWorkingDirectory() {
+	// This is the smallest to reimplement function after ProcessCommandLine where we can disable audio if required
+	if (disableAudio)
+		*g_fNoAudio = 1;
+	
+	if (!*g_pWorkingDirectory)
+		*g_pWorkingDirectory = strdup("assets/");
 }
 
 void patch_runner(void) {
+	FreePNGFile = so_symbol(&yoyoloader_mod, "_Z11FreePNGFilev");
+	ReadPNGFile = so_symbol(&yoyoloader_mod, "_Z11ReadPNGFilePviPiS0_b");
+	InvalidateTextureState = so_symbol(&yoyoloader_mod, "_Z23_InvalidateTextureStatev");
+	
+	hook_addr(so_symbol(&yoyoloader_mod, "png_get_IHDR"), (uintptr_t)&png_get_IHDR_hook);
+	hook_addr(so_symbol(&yoyoloader_mod, "_Z19SetWorkingDirectoryv"), (uintptr_t)&SetWorkingDirectory);
+	
+	uint8_t has_mips = 1;
+	uint32_t *LoadTextureFromPNG = (uint32_t *)so_symbol(&yoyoloader_mod, "_Z18LoadTextureFromPNGP7Texture10eMipEnable");
+	if (!LoadTextureFromPNG) {
+		LoadTextureFromPNG = (uint32_t *)so_symbol(&yoyoloader_mod, "_Z18LoadTextureFromPNGP7Texture");
+		has_mips = 0;
+	}
+	
+	debugPrintf("LoadTextureFromPNG has signature: 0x%X\n", *LoadTextureFromPNG);
+	if (!has_mips) {
+		uint32_t *p = LoadTextureFromPNG;
+		for (;;) {
+			if (*p == 0xE5900020) { // LDR R0, [R0,#0x20]
+				debugPrintf("Patching LoadTextureFromPNG to variant #4\n");
+				hook_addr(LoadTextureFromPNG, (uintptr_t)&LoadTextureFromPNG_4);
+				break;
+			} else if (*p == 0xE5900024) { // LDR R0, [R0,#0x24]
+				debugPrintf("Patching LoadTextureFromPNG to variant #3\n");
+				hook_addr(LoadTextureFromPNG, (uintptr_t)&LoadTextureFromPNG_3);
+				break;
+			}
+			p++;
+		}
+	} else {
+		switch (*LoadTextureFromPNG >> 16) {
+		case 0xE92D:
+			debugPrintf("Patching LoadTextureFromPNG to variant #1\n");
+			hook_addr(LoadTextureFromPNG, (uintptr_t)&LoadTextureFromPNG_1);
+			break;
+		case 0xE590:
+			debugPrintf("Patching LoadTextureFromPNG to variant #2\n");
+			hook_addr(LoadTextureFromPNG, (uintptr_t)&LoadTextureFromPNG_2);
+			break;
+		default:
+			fatal_error("Error: Unrecognized LoadTextureFromPNG signature: 0x%08X.", *LoadTextureFromPNG);
+			break;
+		}
+	}
+
+	hook_addr(so_symbol(&yoyoloader_mod, "_ZN9DbgServer4InitEv"), (uintptr_t)&ret0);
+	hook_addr(so_symbol(&yoyoloader_mod, "_ZN9DbgServerC2Eb"), (uintptr_t)&ret0);
+	hook_addr(so_symbol(&yoyoloader_mod, "_ZN9DbgServerD2Ev"), (uintptr_t)&ret0);
+	
 	hook_addr(so_symbol(&yoyoloader_mod, "_Z30PackageManagerHasSystemFeaturePKc"), (uintptr_t)&ret0);
 	hook_addr(so_symbol(&yoyoloader_mod, "_Z17alBufferDebugNamejPKc"), (uintptr_t)&ret0);
 	hook_addr(so_symbol(&yoyoloader_mod, "_ZN13MemoryManager10DumpMemoryEP7__sFILE"), (uintptr_t)&ret0);
 	hook_addr(so_symbol(&yoyoloader_mod, "_ZN13MemoryManager10DumpMemoryEPvS0_"), (uintptr_t)&ret0);
+	hook_addr(so_symbol(&yoyoloader_mod, "_ZN13MemoryManager10DumpMemoryEPvS0_b"), (uintptr_t)&ret0);
 
 	hook_addr(so_symbol(&yoyoloader_mod, "_Z23YoYo_GetPlatform_DoWorkv"), (uintptr_t)&GetPlatform);
 	hook_addr(so_symbol(&yoyoloader_mod, "_Z20GET_YoYo_GetPlatformP9CInstanceiP6RValue"), (uintptr_t)&GetPlatformInstance);
@@ -703,6 +1027,10 @@ void patch_runner(void) {
 }
 
 void patch_runner_post_init(void) {
+	g_fNoAudio = (uint8_t *)so_symbol(&yoyoloader_mod, "g_fNoAudio");
+	g_pWorkingDirectory = (char *)so_symbol(&yoyoloader_mod, "g_pWorkingDirectory");
+	g_TextureScale = (int *)so_symbol(&yoyoloader_mod, "g_TextureScale");
+	
 	int *dbg_csol = (int *)so_symbol(&yoyoloader_mod, "_dbg_csol");
 	if (dbg_csol) {
 		kuKernelCpuUnrestrictedMemcpy((void *)(*(int *)so_symbol(&yoyoloader_mod, "_dbg_csol") + 0x0C), (void *)(so_symbol(&yoyoloader_mod, "_ZTV11TRelConsole") + 0x14), 4);
@@ -773,6 +1101,10 @@ extern const char *BIONIC_ctype_;
 extern const short *BIONIC_tolower_tab_;
 extern const short *BIONIC_toupper_tab_;
 
+size_t __ctype_get_mb_cur_max() {
+	return 1;
+}
+
 static FILE __sF_fake[0x100][3];
 
 int stat_hook(const char *pathname, void *statbuf) {
@@ -783,28 +1115,66 @@ int stat_hook(const char *pathname, void *statbuf) {
 	return res;
 }
 
-void *AAssetManager_open(void *mgr, const char *filename, int mode) {
-	return NULL;
+typedef struct {
+	uint8_t *buf;
+	off_t sz;
+	int offs;
+} AAssetHandle;
+
+AAssetHandle *AAssetManager_open(unzFile apk_file, const char *fname, int mode) {
+	debugPrintf("AAssetManager_open %s\n", fname);
+	char path[256];
+	sprintf(path, "assets/%s", fname);
+	int res = unzLocateFile(apk_file, path, NULL);
+	if (res != UNZ_OK)
+		return NULL;
+	AAssetHandle *ret = (AAssetHandle *)vglMalloc(sizeof(AAssetHandle));
+	unz_file_info file_info;
+	unzGetCurrentFileInfo(apk_file, &file_info, NULL, 0, NULL, 0, NULL, 0);
+	ret->sz = file_info.uncompressed_size;
+	ret->buf = (uint8_t *)vglMalloc(ret->sz);
+	ret->offs = 0;
+	unzOpenCurrentFile(apk_file);
+	unzReadCurrentFile(apk_file, ret->buf, ret->sz);
+	unzCloseCurrentFile(apk_file);
+	return ret;
 }
 
-void *AAsset_close() {
-	return NULL;
+void AAsset_close(AAssetHandle *f) {
+	if (f) {
+		vglFree(f->buf);
+		vglFree(f);
+	}
 }
 
-void *AAssetManager_fromJava() {
-	return NULL;
+unzFile AAssetManager_fromJava(void *env, void *obj) {
+	return unzOpen(apk_path);
 }
 
-void *AAsset_read() {
-	return NULL;
+int AAsset_read(AAssetHandle *f, void *buf, size_t count) {
+	int read_count = (f->offs + count) > f->sz ? (f->sz - f->offs) : count;
+	sceClibMemcpy(buf, &f->buf[f->offs], read_count);
+	f->offs += read_count;
+	return read_count;
 }
 
-void *AAsset_seek() {
-	return NULL;
+off_t AAsset_seek(AAssetHandle *f, off_t offs, int whence) {
+	switch (whence) {
+	case SEEK_SET:
+		f->offs = offs;
+		break;
+	case SEEK_END:
+		f->offs = f->sz + offs;
+		break;
+	case SEEK_CUR:
+		f->offs += offs;
+		break;
+	}
+	return f->offs;
 }
 
-void *AAsset_getLength() {
-	return NULL;
+off_t AAsset_getLength(AAssetHandle *f) {
+	return f->sz;
 }
 
 int fstat_hook(int fd, void *statbuf) {
@@ -819,109 +1189,11 @@ void *dlopen_hook(const char *filename, int flags) {
 	debugPrintf("Opening %s\n", filename);
 	if (forceGL1 && strstr(filename, "v2"))
 		return NULL;
+#if 0	
+	if (!strcmp(filename, "libOpenSLES.so"))
+		return NULL;
+#endif
 	return (void *)0xDEADBEEF;
-}
-
-void glShaderSourceHook(GLuint shader, GLsizei count, const GLchar **string, const GLint *length) {
-	uint32_t sha1[5];
-	SHA1_CTX ctx;
-	
-	int size = length ? *length : strlen(*string);
-	if (size == 0) {
-		debugPrintf("Attempt to load an empty shader, may be an unsupported platform target\n");
-		return;
-	}
-	sha1_init(&ctx);
-	sha1_update(&ctx, (uint8_t *)*string, size);
-	sha1_final(&ctx, (uint8_t *)sha1);
-
-	char sha_name[64];
-	snprintf(sha_name, sizeof(sha_name), "%08x%08x%08x%08x%08x", sha1[0], sha1[1], sha1[2], sha1[3], sha1[4]);
-
-	char gxp_path[128], glsl_path[128];;
-	snprintf(gxp_path, sizeof(gxp_path), "%s/%s.gxp", GXP_PATH, sha_name);
-
-	FILE *file = fopen(gxp_path, "rb");
-	if (!file) {
-		debugPrintf("Could not find %s\n", gxp_path);
-		
-		// Dump GLSL shader earlier if debugging shaders to solve possible translation phase crashes
-		if (debugShaders) {
-			snprintf(glsl_path, sizeof(glsl_path), "%s/%s.glsl", GLSL_PATH, sha_name);
-			file = fopen(glsl_path, "w");
-			if (file) {
-				fwrite(*string, 1, size, file);
-				fclose(file);
-			}
-		}
-		
-		char *cg_shader;
-		int type;
-		glGetShaderiv(shader, GL_SHADER_TYPE, &type);
-		if (type == GL_FRAGMENT_SHADER) {
-			cg_shader = translate_frag_shader(*string, size);
-		} else {
-			cg_shader = translate_vert_shader(*string, size);
-		}
-	
-		glShaderSource(shader, 1, &cg_shader, NULL);
-		glCompileShader(shader);
-		int compiled;
-		glGetShaderiv(shader, GL_COMPILE_STATUS, &compiled);
-		
-		// Debug
-		if (debugShaders) {
-			snprintf(glsl_path, sizeof(glsl_path), "%s/%s.cg", GLSL_PATH, sha_name);
-			debugPrintf("Saving translated output on %s\n", glsl_path);
-			file = fopen(glsl_path, "w");
-			if (file) {
-				fwrite(cg_shader, 1, strlen(cg_shader), file);
-				fclose(file);
-			}
-		}
-		vglFree(cg_shader);
-
-		if (!compiled) {
-			debugPrintf("Translated shader has errors... Falling back to default shader!\n");
-			if (!debugShaders) {
-				snprintf(glsl_path, sizeof(glsl_path), "%s/%s.glsl", GLSL_PATH, sha_name);
-				file = fopen(glsl_path, "w");
-				if (file) {
-					fwrite(*string, 1, size, file);
-					fclose(file);
-				}
-			}
-			snprintf(gxp_path, sizeof(gxp_path), "%s/%s.gxp", GXP_PATH, type == GL_FRAGMENT_SHADER ? "bb4a9846ba51f476c322f32ddabf6461bc63cc5e" : "eb3eaf87949a211f2cec6acdae6f5d94ba13301e");
-			file = fopen(gxp_path, "rb");
-		} else {
-			debugPrintf("Translated shader successfully compiled!\n");
-			void *bin = vglMalloc(0x8000);
-			int bin_len;
-			vglGetShaderBinary(shader, 0x8000, &bin_len, bin);
-			file = fopen(gxp_path, "wb");
-			fwrite(bin, 1, bin_len, file);
-			fclose(file);
-			vglFree(bin);
-			return;		
-		}
-	}
-
-	if (file) {
-		size_t shaderSize;
-		void *shaderBuf;
-
-		fseek(file, 0, SEEK_END);
-		shaderSize = ftell(file);
-		fseek(file, 0, SEEK_SET);
-
-		shaderBuf = vglMalloc(shaderSize);
-		fread(shaderBuf, 1, shaderSize, file);
-		fclose(file);
-
-		glShaderBinary(1, &shader, 0, shaderBuf, shaderSize);
-
-		vglFree(shaderBuf);
-	}
 }
 
 void glTexParameteriHook(GLenum target, GLenum pname, GLint param) {
@@ -938,13 +1210,6 @@ void glTexParameterfHook(GLenum target, GLenum pname, GLfloat param) {
 	glTexParameteri(target, pname, param);
 }
 
-void glTexImage2DHook(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLint border, GLenum format, GLenum type, const void * data) {
-	if (compressTextures && data && width >= 1024 && height >= 1024) // Compress just big spritesets since smaller ones get updated via glTexSubImage2D
-		glTexImage2D(target, level, GL_COMPRESSED_RGBA_S3TC_DXT5_EXT, width, height, border, format, type, data);
-	else
-		glTexImage2D(target, level, internalformat, width, height, border, format, type, data);
-}
-
 void *retJNI(int dummy) {
 	return fake_env;
 }
@@ -957,11 +1222,12 @@ void glBindFramebufferHook(GLenum target, GLuint framebuffer) {
 }
 
 const char *gl_ret0[] = {
-	"glCompileShader",
 	"glDeleteRenderbuffers",
 	"glDiscardFramebufferEXT",
 	"glFramebufferRenderbuffer",
 	"glGenRenderbuffers",
+	"glGetError",
+	"glBindRenderbuffer",
 	"glHint",
 	"glLightf",
 	"glMaterialx",
@@ -972,33 +1238,65 @@ const char *gl_ret0[] = {
 };
 static size_t gl_numret = sizeof(gl_ret0) / sizeof(*gl_ret0);
 
+void glReadPixelsHook(GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type, GLvoid *data) {
+	if (deltarune_hack)
+		glFinish();
+	glReadPixels(x, y, width, height, format, type, data);
+}
+
+void glShaderSourceHook(GLuint shader, GLsizei count, const GLchar **string, const GLint *length) {	
+	if (debugShaders) {
+		char glsl_path[256];
+		static int shader_idx = 0;
+		snprintf(glsl_path, sizeof(glsl_path), "%s/%d.glsl", GLSL_PATH, shader_idx++);
+		FILE *file = fopen(glsl_path, "w");
+		fprintf(file, "%s", *string);
+		fclose(file);
+	}
+	
+	glShaderSource(shader, count, string, length);
+}
+
 static so_default_dynlib gl_hook[] = {
-	{"glShaderSource", (uintptr_t)&glShaderSourceHook},
-	{"glTexImage2D", (uintptr_t)&glTexImage2DHook},
 	{"glTexParameterf", (uintptr_t)&glTexParameterfHook},
 	{"glTexParameteri", (uintptr_t)&glTexParameteriHook},
 	{"glBindFramebuffer", (uintptr_t)&glBindFramebufferHook},
+	{"glReadPixels", (uintptr_t)&glReadPixelsHook},
+	{"glShaderSource", (uintptr_t)&glShaderSourceHook},
 };
 static size_t gl_numhook = sizeof(gl_hook) / sizeof(*gl_hook);
 
-void *dlsym_hook( void *handle, const char *symbol) {
-	for (size_t i = 0; i < gl_numret; ++i) {
-		if (!strcmp(symbol, gl_ret0[i])) {
-			return ret0;
-		}
-	}
-	for (size_t i = 0; i < gl_numhook; ++i) {
-		if (!strcmp(symbol, gl_hook[i].symbol)) {
-			return (void *)gl_hook[i].func;
-		}
-	}
-	return vglGetProcAddress(symbol);
-}
+void *dlsym_hook( void *handle, const char *symbol);
 
 FILE *fopen_hook(char *file, char *mode) {
 	char *s = strstr(file, "/ux0:");
 	if (s)
 		file = s + 1;
+	else {
+		s = strstr(file, "ux0:");
+		if (!s) {
+#ifdef STANDALONE_MODE
+			s = strstr(file, "app0:");
+			if (!s)
+#endif
+			{
+#ifdef STANDALONE_MODE
+				FILE *f = NULL;
+				if (mode[0] != 'w') {
+					char patched_fname[256];
+					sprintf(patched_fname, "app0:%s", file);
+					f = fopen(patched_fname, mode);
+				}
+				
+				if (f)
+					return f;
+#endif
+				char patched_fname[256];
+				sprintf(patched_fname, "%s%s", data_path_root, file);
+				return fopen(patched_fname, mode);
+			}
+		}
+	}
 	if (mode[0] == 'w')
 		recursive_mkdir(file);
 	return fopen(file, mode);
@@ -1124,12 +1422,124 @@ int nanosleep_hook(const struct timespec *req, struct timespec *rem) {
 	return sceKernelDelayThreadCB(usec);
 }
 
+size_t __strlen_chk(const char *s, size_t s_len) {
+	return strlen(s);
+}
+
+int __vsprintf_chk(char* dest, int flags, size_t dest_len_from_compiler, const char *format, va_list va) {
+	return vsprintf(dest, format, va);
+}
+
+void *__memmove_chk(void *dest, const void *src, size_t len, size_t dstlen) {
+	return memmove(dest, src, len);
+}
+
+void *__memset_chk(void *dest, int val, size_t len, size_t dstlen) {
+	return memset(dest, val, len);
+}
+
+size_t __strlcat_chk (char *dest, char *src, size_t len, size_t dstlen) {
+	return strlcat(dest, src, len);
+}
+
+size_t __strlcpy_chk (char *dest, char *src, size_t len, size_t dstlen) {
+	return strlcpy(dest, src, len);
+}
+
+char* __strchr_chk(const char* p, int ch, size_t s_len) {
+	return strchr(p, ch);
+}
+
+char *__strcat_chk(char *dest, const char *src, size_t destlen) {
+	return strcat(dest, src);
+}
+
+char *__strrchr_chk(const char *p, int ch, size_t s_len) {
+	return strrchr(p, ch);
+}
+
+char *__strcpy_chk(char *dest, const char *src, size_t destlen) {
+	return strcpy(dest, src);
+}
+
+char *__strncat_chk(char *s1, const char *s2, size_t n, size_t s1len) {
+	return strncat(s1, s2, n);
+}
+
+void *__memcpy_chk(void *dest, const void *src, size_t len, size_t destlen) {
+	return memcpy(dest, src, len);
+}
+
+int __vsnprintf_chk(char *s, size_t maxlen, int flag, size_t slen, const char *format, va_list args) {
+	return vsnprintf(s, maxlen, format, args);
+}
+
+int posix_memalign(void **memptr, size_t alignment, size_t size) {
+	*memptr = vglMemalign(alignment, size);
+	return 0;
+}
+
 static so_default_dynlib net_dynlib[] = {
 	{ "bind", (uintptr_t)&bind },
 	{ "socket", (uintptr_t)&socket },
 };
 
+void abort_hook() {
+	debugPrintf("abort called by %p %s\n", __builtin_return_address(0));
+	sceKernelExitProcess(0);
+}
+
 static so_default_dynlib default_dynlib[] = {
+	{ "SL_IID_ANDROIDSIMPLEBUFFERQUEUE", (uintptr_t)&SL_IID_ANDROIDSIMPLEBUFFERQUEUE},
+	{ "SL_IID_AUDIOIODEVICECAPABILITIES", (uintptr_t)&SL_IID_AUDIOIODEVICECAPABILITIES},
+	{ "SL_IID_BUFFERQUEUE", (uintptr_t)&SL_IID_BUFFERQUEUE},
+	{ "SL_IID_DYNAMICSOURCE", (uintptr_t)&SL_IID_DYNAMICSOURCE},
+	{ "SL_IID_ENGINE", (uintptr_t)&SL_IID_ENGINE},
+	{ "SL_IID_LED", (uintptr_t)&SL_IID_LED},
+	{ "SL_IID_NULL", (uintptr_t)&SL_IID_NULL},
+	{ "SL_IID_METADATAEXTRACTION", (uintptr_t)&SL_IID_METADATAEXTRACTION},
+	{ "SL_IID_METADATATRAVERSAL", (uintptr_t)&SL_IID_METADATATRAVERSAL},
+	{ "SL_IID_OBJECT", (uintptr_t)&SL_IID_OBJECT},
+	{ "SL_IID_OUTPUTMIX", (uintptr_t)&SL_IID_OUTPUTMIX},
+	{ "SL_IID_PLAY", (uintptr_t)&SL_IID_PLAY},
+	{ "SL_IID_VIBRA", (uintptr_t)&SL_IID_VIBRA},
+	{ "SL_IID_VOLUME", (uintptr_t)&SL_IID_VOLUME},
+	{ "SL_IID_PREFETCHSTATUS", (uintptr_t)&SL_IID_PREFETCHSTATUS},
+	{ "SL_IID_PLAYBACKRATE", (uintptr_t)&SL_IID_PLAYBACKRATE},
+	{ "SL_IID_SEEK", (uintptr_t)&SL_IID_SEEK},
+	{ "SL_IID_RECORD", (uintptr_t)&SL_IID_RECORD},
+	{ "SL_IID_EQUALIZER", (uintptr_t)&SL_IID_EQUALIZER},
+	{ "SL_IID_DEVICEVOLUME", (uintptr_t)&SL_IID_DEVICEVOLUME},
+	{ "SL_IID_PRESETREVERB", (uintptr_t)&SL_IID_PRESETREVERB},
+	{ "SL_IID_ENVIRONMENTALREVERB", (uintptr_t)&SL_IID_ENVIRONMENTALREVERB},
+	{ "SL_IID_EFFECTSEND", (uintptr_t)&SL_IID_EFFECTSEND},
+	{ "SL_IID_3DGROUPING", (uintptr_t)&SL_IID_3DGROUPING},
+	{ "SL_IID_3DCOMMIT", (uintptr_t)&SL_IID_3DCOMMIT},
+	{ "SL_IID_3DLOCATION", (uintptr_t)&SL_IID_3DLOCATION},
+	{ "SL_IID_3DDOPPLER", (uintptr_t)&SL_IID_3DDOPPLER},
+	{ "SL_IID_3DSOURCE", (uintptr_t)&SL_IID_3DSOURCE},
+	{ "SL_IID_3DMACROSCOPIC", (uintptr_t)&SL_IID_3DMACROSCOPIC},
+	{ "SL_IID_MUTESOLO", (uintptr_t)&SL_IID_MUTESOLO},
+	{ "SL_IID_DYNAMICINTERFACEMANAGEMENT", (uintptr_t)&SL_IID_DYNAMICINTERFACEMANAGEMENT},
+	{ "SL_IID_MIDIMESSAGE", (uintptr_t)&SL_IID_MIDIMESSAGE},
+	{ "SL_IID_MIDIMUTESOLO", (uintptr_t)&SL_IID_MIDIMUTESOLO},
+	{ "SL_IID_MIDITEMPO", (uintptr_t)&SL_IID_MIDITEMPO},
+	{ "SL_IID_MIDITIME", (uintptr_t)&SL_IID_MIDITIME},
+	{ "SL_IID_AUDIODECODERCAPABILITIES", (uintptr_t)&SL_IID_AUDIODECODERCAPABILITIES},
+	{ "SL_IID_AUDIOENCODERCAPABILITIES", (uintptr_t)&SL_IID_AUDIOENCODERCAPABILITIES},
+	{ "SL_IID_AUDIOENCODER", (uintptr_t)&SL_IID_AUDIOENCODER},
+	{ "SL_IID_BASSBOOST", (uintptr_t)&SL_IID_BASSBOOST},
+	{ "SL_IID_PITCH", (uintptr_t)&SL_IID_PITCH},
+	{ "SL_IID_RATEPITCH", (uintptr_t)&SL_IID_RATEPITCH},
+	{ "SL_IID_VIRTUALIZER", (uintptr_t)&SL_IID_VIRTUALIZER},
+	{ "SL_IID_VISUALIZATION", (uintptr_t)&SL_IID_VISUALIZATION},
+	{ "SL_IID_ENGINECAPABILITIES", (uintptr_t)&SL_IID_ENGINECAPABILITIES},
+	{ "SL_IID_THREADSYNC", (uintptr_t)&SL_IID_THREADSYNC},
+	{ "SL_IID_ANDROIDEFFECT", (uintptr_t)&SL_IID_ANDROIDEFFECT},
+	{ "SL_IID_ANDROIDEFFECTSEND", (uintptr_t)&SL_IID_ANDROIDEFFECTSEND},
+	{ "SL_IID_ANDROIDEFFECTCAPABILITIES", (uintptr_t)&SL_IID_ANDROIDEFFECTCAPABILITIES},
+	{ "SL_IID_ANDROIDCONFIGURATION", (uintptr_t)&SL_IID_ANDROIDCONFIGURATION},
+	{ "slCreateEngine", (uintptr_t)&slCreateEngine },
 	{ "AAssetManager_open", (uintptr_t)&AAssetManager_open},
 	{ "AAsset_close", (uintptr_t)&AAsset_close},
 	{ "AAssetManager_fromJava", (uintptr_t)&AAssetManager_fromJava},
@@ -1185,23 +1595,38 @@ static so_default_dynlib default_dynlib[] = {
 	{ "__aeabi_atexit", (uintptr_t)&__aeabi_atexit },
 	{ "__android_log_print", (uintptr_t)&__android_log_print },
 	{ "__android_log_vprint", (uintptr_t)&__android_log_vprint },
+	{ "__ctype_get_mb_cur_max", (uintptr_t)&__ctype_get_mb_cur_max },
 	{ "__cxa_allocate_exception", (uintptr_t)&__cxa_allocate_exception },
 	{ "__cxa_atexit", (uintptr_t)&__cxa_atexit },
 	{ "__cxa_finalize", (uintptr_t)&__cxa_finalize },
 	{ "__cxa_guard_acquire", (uintptr_t)&__cxa_guard_acquire },
 	{ "__cxa_guard_release", (uintptr_t)&__cxa_guard_release },
 	{ "__cxa_pure_virtual", (uintptr_t)&__cxa_pure_virtual },
+	{ "__cxa_thread_atexit_impl", (uintptr_t)&ret0 },
 	{ "__cxa_throw", (uintptr_t)&__cxa_throw_hook },
 	{ "__errno", (uintptr_t)&__errno },
 	{ "__gnu_unwind_frame", (uintptr_t)&__gnu_unwind_frame },
 	{ "__gnu_Unwind_Find_exidx", (uintptr_t)&ret0 },
+	{ "__memcpy_chk", (uintptr_t)&__memcpy_chk },
+	{ "__memmove_chk", (uintptr_t)&__memmove_chk },
+	{ "__memset_chk", (uintptr_t)&__memset_chk },
 	{ "__progname", (uintptr_t)&__progname },
 	{ "__page_size", (uintptr_t)&__page_size },
 	{ "__sF", (uintptr_t)&__sF_fake },
 	{ "__stack_chk_fail", (uintptr_t)&__stack_chk_fail_fake },
 	{ "__stack_chk_guard", (uintptr_t)&__stack_chk_guard_fake },
+	{ "__strcat_chk", (uintptr_t)&__strcat_chk },
+	{ "__strchr_chk", (uintptr_t)&__strchr_chk },
+	{ "__strcpy_chk", (uintptr_t)&__strcpy_chk },
+	{ "__strlcat_chk", (uintptr_t)&__strlcat_chk },
+	{ "__strlcpy_chk", (uintptr_t)&__strlcpy_chk },
+	{ "__strlen_chk", (uintptr_t)&__strlen_chk },
+	{ "__strncat_chk", (uintptr_t)&__strncat_chk },
+	{ "__strrchr_chk", (uintptr_t)&__strrchr_chk },
+	{ "__vsprintf_chk", (uintptr_t)&__vsprintf_chk },
+	{ "__vsnprintf_chk", (uintptr_t)&__vsnprintf_chk },
 	{ "_ctype_", (uintptr_t)&BIONIC_ctype_},
-	{ "abort", (uintptr_t)&abort },
+	{ "abort", (uintptr_t)&abort_hook },
 	//{ "accept", (uintptr_t)&accept },
 	{ "acos", (uintptr_t)&acos },
 	{ "acosf", (uintptr_t)&acosf },
@@ -1247,6 +1672,7 @@ static so_default_dynlib default_dynlib[] = {
 	{ "alcSuspendContext", (uintptr_t)&alcSuspendContext },
 	{ "asin", (uintptr_t)&asin },
 	{ "asinf", (uintptr_t)&asinf },
+	{ "asinh", (uintptr_t)&asinh },
 	{ "atan", (uintptr_t)&atan },
 	{ "atan2", (uintptr_t)&atan2 },
 	{ "atan2f", (uintptr_t)&atan2f },
@@ -1277,6 +1703,7 @@ static so_default_dynlib default_dynlib[] = {
 	{ "dlclose", (uintptr_t)&ret0 },
 	{ "dlopen", (uintptr_t)&dlopen_hook },
 	{ "dlsym", (uintptr_t)&dlsym_hook },
+	{ "dlerror", (uintptr_t)&ret0 },
 	{ "exit", (uintptr_t)&exit },
 	{ "exp", (uintptr_t)&exp },
 	{ "expf", (uintptr_t)&expf },
@@ -1291,6 +1718,10 @@ static so_default_dynlib default_dynlib[] = {
 	{ "fgets", (uintptr_t)&fgets },
 	{ "floor", (uintptr_t)&floor },
 	{ "floorf", (uintptr_t)&floorf },
+	{ "fmax", (uintptr_t)&fmax },
+	{ "fmaxf", (uintptr_t)&fmaxf },
+	{ "fmin", (uintptr_t)&fmin },
+	{ "fminf", (uintptr_t)&fminf },
 	{ "fmod", (uintptr_t)&fmod },
 	{ "fmodf", (uintptr_t)&fmodf },
 	{ "fopen", (uintptr_t)&fopen_hook },
@@ -1299,6 +1730,7 @@ static so_default_dynlib default_dynlib[] = {
 	{ "fputs", (uintptr_t)&fputs },
 	{ "fread", (uintptr_t)&fread },
 	{ "free", (uintptr_t)&vglFree },
+	{ "freelocale", (uintptr_t)&freelocale },
 	//{ "freeaddrinfo", (uintptr_t)&freeaddrinfo },
 	{ "frexp", (uintptr_t)&frexp },
 	{ "frexpf", (uintptr_t)&frexpf },
@@ -1311,6 +1743,7 @@ static so_default_dynlib default_dynlib[] = {
 	{ "fwrite", (uintptr_t)&fwrite },
 	{ "getaddrinfo", (uintptr_t)&getaddrinfo },
 	{ "getc", (uintptr_t)&getc },
+	{ "getpid", (uintptr_t)&ret0 },
 	{ "getenv", (uintptr_t)&ret0 },
 	//{ "getsockopt", (uintptr_t)&getsockopt },
 	{ "getwc", (uintptr_t)&getwc },
@@ -1360,11 +1793,11 @@ static so_default_dynlib default_dynlib[] = {
 	{ "glPixelStorei", (uintptr_t)&ret0 },
 	{ "glPopMatrix", (uintptr_t)&glPopMatrix },
 	{ "glPushMatrix", (uintptr_t)&glPushMatrix },
-	{ "glReadPixels", (uintptr_t)&glReadPixels },
+	{ "glReadPixels", (uintptr_t)&glReadPixelsHook },
 	{ "glScissor", (uintptr_t)&glScissor },
 	{ "glTexCoordPointer", (uintptr_t)&glTexCoordPointer },
 	{ "glTexEnvi", (uintptr_t)&glTexEnvi },
-	{ "glTexImage2D", (uintptr_t)&glTexImage2DHook },
+	{ "glTexImage2D", (uintptr_t)&glTexImage2D },
 	{ "glTexParameterf", (uintptr_t)&glTexParameterfHook },
 	{ "glTexParameteri", (uintptr_t)&glTexParameteriHook },
 	{ "glVertexPointer", (uintptr_t)&glVertexPointer },
@@ -1408,14 +1841,22 @@ static so_default_dynlib default_dynlib[] = {
 	{ "localtime_r", (uintptr_t)&localtime_r },
 	{ "localtime64", (uintptr_t)&localtime64 },
 	{ "log", (uintptr_t)&log },
+	{ "logf", (uintptr_t)&logf },
+	{ "log2", (uintptr_t)&log2 },
 	{ "log10", (uintptr_t)&log10 },
+	{ "log10f", (uintptr_t)&log10f },
 	{ "longjmp", (uintptr_t)&longjmp },
 	{ "lrand48", (uintptr_t)&lrand48 },
 	{ "lrint", (uintptr_t)&lrint },
 	{ "lrintf", (uintptr_t)&lrintf },
+	{ "lround", (uintptr_t)&lround },
+	{ "lroundf", (uintptr_t)&lroundf },
 	{ "lseek", (uintptr_t)&lseek },
 	{ "malloc", (uintptr_t)&vglMalloc },
+	{ "mbtowc", (uintptr_t)&mbtowc },
+	{ "mbrlen", (uintptr_t)&mbrlen },
 	{ "mbrtowc", (uintptr_t)&mbrtowc },
+	{ "mbsrtowcs", (uintptr_t)&mbsrtowcs },
 	{ "memalign", (uintptr_t)&vglMemalign },
 	{ "memchr", (uintptr_t)&sceClibMemchr },
 	{ "memcmp", (uintptr_t)&memcmp },
@@ -1430,7 +1871,9 @@ static so_default_dynlib default_dynlib[] = {
 	{ "modff", (uintptr_t)&modff },
 	{ "munmap", (uintptr_t)&munmap },
 	{ "nanosleep", (uintptr_t)&nanosleep_hook },
+	{ "newlocale", (uintptr_t)&newlocale },
 	{ "open", (uintptr_t)&open },
+	{ "posix_memalign", (uintptr_t)&posix_memalign },
 	{ "pow", (uintptr_t)&pow },
 	{ "powf", (uintptr_t)&powf },
 	{ "printf", (uintptr_t)&debugPrintf },
@@ -1452,18 +1895,26 @@ static so_default_dynlib default_dynlib[] = {
 	{ "pthread_mutexattr_destroy", (uintptr_t)&pthread_mutexattr_destroy},
 	{ "pthread_mutexattr_init", (uintptr_t)&pthread_mutexattr_init},
 	{ "pthread_mutexattr_settype", (uintptr_t)&pthread_mutexattr_settype},
+	{ "pthread_rwlock_destroy", (uintptr_t)&pthread_rwlock_destroy_fake },
+	{ "pthread_rwlock_init", (uintptr_t)&pthread_rwlock_init_fake },
+	{ "pthread_rwlock_rdlock", (uintptr_t)&pthread_rwlock_rdlock_fake },
+	{ "pthread_rwlock_unlock", (uintptr_t)&pthread_rwlock_unlock_fake },
+	{ "pthread_rwlock_wrlock", (uintptr_t)&pthread_rwlock_wrlock_fake },
+	{ "pthread_once", (uintptr_t)&pthread_once_fake},
 	{ "pthread_setspecific", (uintptr_t)&pthread_setspecific},
 	{ "pthread_getspecific", (uintptr_t)&pthread_getspecific},
 	{ "putc", (uintptr_t)&putc },
 	{ "putwc", (uintptr_t)&putwc },
 	{ "qsort", (uintptr_t)&qsort },
 	{ "read", (uintptr_t)&read },
-	{ "realloc", (uintptr_t)&realloc },
+	{ "realloc", (uintptr_t)&vglRealloc },
 	//{ "recv", (uintptr_t)&recv },
 	//{ "recvfrom", (uintptr_t)&recvfrom },
 	{ "remove", (uintptr_t)&sceIoRemove },
 	{ "rename", (uintptr_t)&sceIoRename },
 	{ "rint", (uintptr_t)&rint },
+	{ "round", (uintptr_t)&round },
+	{ "roundf", (uintptr_t)&roundf },
 	{ "scandir", (uintptr_t)&scandir_hook },
 	//{ "send", (uintptr_t)&send },
 	//{ "sendto", (uintptr_t)&sendto },
@@ -1473,6 +1924,7 @@ static so_default_dynlib default_dynlib[] = {
 	//{ "setsockopt", (uintptr_t)&setsockopt },
 	{ "setvbuf", (uintptr_t)&setvbuf },
 	{ "sin", (uintptr_t)&sin },
+	{ "sincos", (uintptr_t)&sincos },
 	{ "sincosf", (uintptr_t)&sincosf },
 	{ "sinf", (uintptr_t)&sinf },
 	{ "sinh", (uintptr_t)&sinh },
@@ -1481,6 +1933,7 @@ static so_default_dynlib default_dynlib[] = {
 	{ "sprintf", (uintptr_t)&sprintf },
 	{ "sqrt", (uintptr_t)&sqrt },
 	{ "sqrtf", (uintptr_t)&sqrtf },
+	{ "srand", (uintptr_t)&srand },
 	{ "srand48", (uintptr_t)&srand48 },
 	{ "sscanf", (uintptr_t)&sscanf },
 	{ "stat", (uintptr_t)&stat_hook },
@@ -1494,6 +1947,7 @@ static so_default_dynlib default_dynlib[] = {
 	{ "strdup", (uintptr_t)&strdup },
 	{ "strndup", (uintptr_t)&strndup },
 	{ "strerror", (uintptr_t)&strerror },
+	{ "strerror_r", (uintptr_t)&strerror_r },
 	{ "strftime", (uintptr_t)&strftime },
 	{ "strlen", (uintptr_t)&strlen },
 	{ "strncasecmp", (uintptr_t)&sceClibStrncasecmp },
@@ -1503,12 +1957,18 @@ static so_default_dynlib default_dynlib[] = {
 	{ "strpbrk", (uintptr_t)&strpbrk },
 	{ "strrchr", (uintptr_t)&sceClibStrrchr },
 	{ "strstr", (uintptr_t)&sceClibStrstr },
+	{ "strtof", (uintptr_t)&strtof },
 	{ "strtod", (uintptr_t)&strtod },
+	{ "strtoimax", (uintptr_t)&strtoimax },
 	{ "strtok", (uintptr_t)&strtok },
 	{ "strtol", (uintptr_t)&strtol },
+	{ "strtold", (uintptr_t)&strtold },
 	{ "strtoll", (uintptr_t)&strtoll },
 	{ "strtoul", (uintptr_t)&strtoul },
+	{ "strtoull", (uintptr_t)&strtoull },
+	{ "strtoumax", (uintptr_t)&strtoumax },
 	{ "strxfrm", (uintptr_t)&strxfrm },
+	{ "swprintf", (uintptr_t)&swprintf },
 	{ "sysconf", (uintptr_t)&ret0 },
 	{ "tan", (uintptr_t)&tan },
 	{ "tanf", (uintptr_t)&tanf },
@@ -1521,20 +1981,30 @@ static so_default_dynlib default_dynlib[] = {
 	{ "towupper", (uintptr_t)&towupper },
 	{ "ungetc", (uintptr_t)&ungetc },
 	{ "ungetwc", (uintptr_t)&ungetwc },
+	{ "uselocale", (uintptr_t)&uselocale },
 	{ "usleep", (uintptr_t)&usleep },
 	{ "vasprintf", (uintptr_t)&vasprintf },
 	{ "vfprintf", (uintptr_t)&vfprintf },
 	{ "vprintf", (uintptr_t)&vprintf },
 	{ "vsnprintf", (uintptr_t)&vsnprintf },
 	{ "vsprintf", (uintptr_t)&vsprintf },
+	{ "vsscanf", (uintptr_t)&vsscanf },
 	{ "vswprintf", (uintptr_t)&vswprintf },
 	{ "wcrtomb", (uintptr_t)&wcrtomb },
 	{ "wcscoll", (uintptr_t)&wcscoll },
 	{ "wcscmp", (uintptr_t)&wcscmp },
 	{ "wcsncpy", (uintptr_t)&wcsncpy },
+	{ "wcsnrtombs", (uintptr_t)&wcsnrtombs },
 	{ "wcsftime", (uintptr_t)&wcsftime },
 	{ "wcslen", (uintptr_t)&wcslen },
 	{ "wcsxfrm", (uintptr_t)&wcsxfrm },
+	{ "wcstod", (uintptr_t)&wcstod },
+	{ "wcstof", (uintptr_t)&wcstof },
+	{ "wcstol", (uintptr_t)&wcstol },
+	{ "wcstold", (uintptr_t)&wcstold },
+	{ "wcstoll", (uintptr_t)&wcstoll },
+	{ "wcstoul", (uintptr_t)&wcstoul },
+	{ "wcstoull", (uintptr_t)&wcstoull },
 	{ "wctob", (uintptr_t)&wctob },
 	{ "wctype", (uintptr_t)&wctype },
 	{ "wmemchr", (uintptr_t)&wmemchr },
@@ -1545,6 +2015,31 @@ static so_default_dynlib default_dynlib[] = {
 	{ "write", (uintptr_t)&write },
 };
 
+void *dlsym_hook( void *handle, const char *symbol) {
+	for (size_t i = 0; i < gl_numret; ++i) {
+		if (!strcmp(symbol, gl_ret0[i])) {
+			return ret0;
+		}
+	}
+	for (size_t i = 0; i < gl_numhook; ++i) {
+		if (!strcmp(symbol, gl_hook[i].symbol)) {
+			return (void *)gl_hook[i].func;
+		}
+	}
+	
+	void *func = vglGetProcAddress(symbol);
+	
+	if (!func) {
+		for (size_t i = 0; i < sizeof(default_dynlib) / sizeof(so_default_dynlib); i++) {
+			if (!strcmp(symbol, default_dynlib[i].symbol)) {
+				return default_dynlib[i].func;
+			}
+		}
+	}
+	
+	return func;
+}
+
 int check_kubridge(void) {
 	int search_unk[2];
 	return _vshKernelSearchModuleByName("kubridge", search_unk);
@@ -1554,17 +2049,27 @@ enum MethodIDs {
 	UNKNOWN = 0,
 	CALL_EXTENSION_FUNCTION,
 	DOUBLE_VALUE,
+	GAMEPAD_CONNECTED,
+	GAMEPAD_DESCRIPTION,
 	GET_UDID,
 	GET_DEFAULT_FRAMEBUFFER,
 	HTTP_POST,
 	HTTP_GET,
 	INIT,
-	OS_GET_INFO,
 	INPUT_STRING_ASYNC,
+	OS_GET_INFO,
+	PAUSE_MP3,
+	PLAY_MP3,
+	RESUME_MP3,
 	SHOW_MESSAGE,
 	SHOW_MESSAGE_ASYNC,
-	GAMEPAD_CONNECTED,
-	GAMEPAD_DESCRIPTION
+	STOP_MP3,
+	PLAYING_MP3,
+	GET_MIN_BUFFER_SIZE,
+	PLAY,
+	STOP,
+	RELEASE,
+	WRITE
 } MethodIDs;
 
 typedef struct {
@@ -1573,19 +2078,29 @@ typedef struct {
 } NameToMethodID;
 
 static NameToMethodID name_to_method_ids[] = {
-	{ "<init>", INIT },
 	{ "CallExtensionFunction", CALL_EXTENSION_FUNCTION },
 	{ "doubleValue", DOUBLE_VALUE },
+	{ "GamepadConnected", GAMEPAD_CONNECTED },
+	{ "GamepadDescription", GAMEPAD_DESCRIPTION },
 	{ "GetUDID", GET_UDID },
 	{ "GetDefaultFrameBuffer", GET_DEFAULT_FRAMEBUFFER },
 	{ "HttpGet", HTTP_GET },
 	{ "HttpPost", HTTP_POST },
+	{ "<init>", INIT },
 	{ "InputStringAsync", INPUT_STRING_ASYNC },
 	{ "OsGetInfo", OS_GET_INFO },
+	{ "PauseMP3", PAUSE_MP3 },
+	{ "PlayMP3", PLAY_MP3 },
+	{ "PlayingMP3", PLAYING_MP3 },
+	{ "ResumeMP3", RESUME_MP3 },
 	{ "ShowMessage", SHOW_MESSAGE },
 	{ "ShowMessageAsync", SHOW_MESSAGE_ASYNC },
-	{ "GamepadConnected", GAMEPAD_CONNECTED },
-	{ "GamepadDescription", GAMEPAD_DESCRIPTION },
+	{ "StopMP3", STOP_MP3 },
+	{ "getMinBufferSize", GET_MIN_BUFFER_SIZE },
+	{ "play", PLAY },
+	{ "stop", STOP },
+	{ "release", RELEASE },
+	{ "write", WRITE },
 };
 
 int GetMethodID(void *env, void *class, const char *name, const char *sig) {
@@ -1638,6 +2153,18 @@ void CallStaticVoidMethodV(void *env, void *obj, int methodID, uintptr_t *args) 
 			get_active = 1;
 		}
 		break;
+	case PLAY_MP3:
+		audio_player_play(args[0], args[1]);
+		break;
+	case STOP_MP3:
+		audio_player_stop();
+		break;
+	case PAUSE_MP3:
+		audio_player_pause();
+		break;
+	case RESUME_MP3:
+		audio_player_resume();
+		break;
 	default:
 		if (methodID != UNKNOWN)
 			debugPrintf("CallStaticVoidMethodV(%d)\n", methodID);
@@ -1649,6 +2176,8 @@ int CallStaticBooleanMethodV(void *env, void *obj, int methodID, uintptr_t *args
 	switch (methodID) {
 	case GAMEPAD_CONNECTED:
 		return is_gamepad_connected(args[0]);
+	case PLAYING_MP3:
+		return audio_player_is_playing();
 	default:
 		if (methodID != UNKNOWN)
 			debugPrintf("CallStaticBooleanMethodV(%d)\n", methodID);
@@ -1670,12 +2199,16 @@ uint64_t CallLongMethodV(void *env, void *obj, int methodID, uintptr_t *args) {
 }
 
 enum ClassIDs {
-	STRING
+	STRING,
+	AUDIO_TRACK
 };
 
 int FindClass(void *env, const char *name) {
+	debugPrintf("FindClass %s\n", name);
 	if (!strcmp(name, "java/lang/String")) {
 		return STRING;
+	} else if (!strcmp(name, "android/media/AudioTrack")) {
+		return AUDIO_TRACK;
 	}
 	return 0x41414141;
 }
@@ -1685,7 +2218,7 @@ void *NewGlobalRef(void *env, char *str) {
 }
 
 void *NewWeakGlobalRef(void *env, char *str) {
-	return (void *)0x42424242;
+	return (void *)0x45454545;
 }
 
 void DeleteGlobalRef(void *env, char *str) {
@@ -1774,15 +2307,31 @@ void *CallStaticObjectMethodV(void *env, void *obj, int methodID, uintptr_t *arg
 	case CALL_EXTENSION_FUNCTION:
 		{
 			ext_func *f = (ext_func *)args;
-			if (!strcmp(f->module_name, "PickMe")) {
+			if (!strcmp(f->module_name, "PickMe")) { // Used by Super Mario Maker: World Engine
 				if (!strcmp(f->method_name, "getDire1")) {
-					sprintf(r, "%s%s/", data_path, f->object_array);
+					sprintf(r, "%s%s/", data_path, (char *)f->object_array);
 					recursive_mkdir(r);
 					return f->object_array;
 				}
-			} else if (!strcmp(f->module_name, "NOTCH")) {
-				jni_double = 0.0f;
+			} else if (!strcmp(f->module_name, "NOTCH")) { // Used by Forager
+				jni_double = 0.0;
 				return &jni_double;
+			} else if (!strcmp(f->module_name, "OUYAExt")) { // Used by Angry Ranook
+				if (!strcmp(f->method_name, "ouyaIsOUYA")) {
+					jni_double = 1.0;
+					return &jni_double;
+				}
+			} else if (!strcmp(f->module_name, "myclass")) { // Used by IMSCARED
+				if (!strcmp(f->method_name, "vibrate_start")) {
+					return NULL;
+				} else if (!strcmp(f->method_name, "getScreenBrightness")) {
+					int val;
+					if (sceRegMgrGetKeyInt("/CONFIG/DISPLAY/", "brightness", &val) < 0)
+						jni_double = -1.0;
+					else
+						jni_double = ((double)val / 65536.0) * 128.0;
+					return &jni_double;
+				}
 			}
 			debugPrintf("Called undefined extension function from module %s with name %s\n", f->module_name, f->method_name);
 			return NULL;
@@ -1794,10 +2343,20 @@ void *CallStaticObjectMethodV(void *env, void *obj, int methodID, uintptr_t *arg
 	}
 }
 
+int audio_samplerate;
+int audio_channels;
+SceUID audio_port;
+
 int CallStaticIntMethodV(void *env, void *obj, int methodID, uintptr_t *args) {
 	switch (methodID) {
 	case GET_DEFAULT_FRAMEBUFFER:
 		return 0;
+	case GET_MIN_BUFFER_SIZE:
+		audio_samplerate = args[0];
+		audio_channels = args[1] == 0x03 ? 2 : 1;
+		audio_port = sceAudioOutOpenPort(SCE_AUDIO_OUT_PORT_TYPE_VOICE, 4096 / (2 * audio_channels), audio_samplerate, (SceAudioOutMode)(audio_channels - 1));
+		debugPrintf("Asking for %s audio at %dhz samplerate. (Opened port %d)\n", audio_channels == 2 ? "stereo" : "mono", audio_samplerate, audio_port);
+		return 4096;
 	case OS_GET_INFO:
 		return Java_com_yoyogames_runner_RunnerJNILib_CreateVersionDSMap(fake_env, 0, 7, "v1.0", "PSVita", "PSVita", "Sony Computer Entertainment", "armeabi", "armeabi-v7a", "YoYo Loader", "ARM Cortex A9", "v1.0", "Global", "v1.0", 0);
 	default:
@@ -1840,6 +2399,30 @@ double CallDoubleMethodV(void *env, void *obj, int methodID, uintptr_t *args) {
 	return 0.0;
 }
 
+int CallNonVirtualIntMethod(void *env, void *obj, int classID, int methodID, uintptr_t *args) {
+	switch (methodID) {
+	case WRITE:
+		{
+			sceAudioOutOutput(audio_port, (void *)args[0]);
+			return (int)args[2];
+		}
+	default:
+		if (methodID != UNKNOWN)
+			debugPrintf("CallNonVirtualIntMethod(0x%x, %d)\n", classID, methodID);
+		break;
+	}
+	return 0;
+}
+
+void CallNonVirtualVoidMethod(void *env, void *obj, int classID, int methodID, uintptr_t *args) {
+	switch (methodID) {
+	default:
+		if (methodID != UNKNOWN)
+			debugPrintf("CallNonVirtualVoidMethod(0x%x, %d)\n", classID, methodID);
+		break;
+	}
+}
+
 void CallVoidMethodV(void *env, void *obj, int methodID, uintptr_t *args) {
 	switch (methodID) {
 	default:
@@ -1850,13 +2433,17 @@ void CallVoidMethodV(void *env, void *obj, int methodID, uintptr_t *args) {
 }
 
 void *NewIntArray(void *env, int size) {
-	return malloc(sizeof(int) * size);	
+	return vglMalloc(sizeof(int) * size);	
+}
+
+void *NewCharArray(void *env, int size) {
+	return vglMalloc(sizeof(char) * size);
 }
 
 void *NewObjectArray(void *env, int size, int clazz, void *elements) {
 	if (disableObjectsArray)
 		return NULL;
-	void *r = malloc(size);
+	void *r = vglMalloc(size);
 	if (elements) {
 		sceClibMemcpy(r, elements, size);
 	}
@@ -1864,7 +2451,7 @@ void *NewObjectArray(void *env, int size, int clazz, void *elements) {
 }
 
 void *NewDoubleArray(void *env, int size) {
-	return malloc(sizeof(double) * size);	
+	return vglMalloc(sizeof(double) * size);	
 }
 
 int GetArrayLength(void *env, void *array) {
@@ -1879,16 +2466,34 @@ void SetDoubleArrayRegion(void *env, double *array, int start, int len, double *
 	sceClibMemcpy(&array[start], buf, sizeof(double) * len);
 }
 
-void SetObjectArrayElement(void *env, void *array, int index, void *val) {
+void SetObjectArrayElement(void *env, uint8_t *array, int index, void *val) {
 	if (array)
 		strcpy(&array[index], val);
 }
 
-void GetByteArrayRegion(void *env, void *array, int start, int len, void *buf) {
+void GetByteArrayRegion(void *env, uint8_t *array, int start, int len, void *buf) {
 	sceClibMemcpy(buf, &array[start], len);
 }
 
 int GetIntField(void *env, void *obj, int fieldID) { return 0; }
+
+int PushLocalFrame(void *env, int capacity) {
+    return 0;
+}
+
+void *PopLocalFrame(void *env, void *obj) {
+    return NULL;
+}
+
+void *GetPrimitiveArrayCritical(void *env, void *arr, int *isCopy) {
+	if (isCopy)
+		*isCopy = 0;
+
+    return arr;
+}
+
+void ReleasePrimitiveArrayCritical(void *env, void *arr, void *carray, int mode) {
+}
 
 static void game_end()
 {
@@ -1926,8 +2531,19 @@ static void audio_sound_get_track_position(retval_t *ret, void *self, void *othe
 	last_track_pos = ret->rvalue.val;
 }
 
-int main(int argc, char **argv)
-{
+void *pthread_main(void *arg);
+
+int main(int argc, char *argv[]) {
+	pthread_t t;
+	pthread_attr_t attr;
+	pthread_attr_init(&attr);
+	pthread_attr_setstacksize(&attr, 2 * 1024 * 1024);
+	pthread_create(&t, &attr, pthread_main, NULL);
+
+	return sceKernelExitDeleteThread(0);
+}
+
+void *pthread_main(void *arg) {
 #if 0
 	// Debug
 	sceSysmoduleLoadModule(SCE_SYSMODULE_RAZOR_CAPTURE);
@@ -1946,7 +2562,7 @@ int main(int argc, char **argv)
 		sceIoRemove(LAUNCH_FILE_PATH);
 		game_name[size] = 0;
 	} else {
-		strcpy(game_name, "AM2R"); // Debug
+		strcpy(game_name, "test"); // Debug
 	}
 #else
 	sceAppMgrAppParamGetString(0, 12, game_name, 256);
@@ -1972,25 +2588,48 @@ int main(int argc, char **argv)
 #else
 	sprintf(apk_path, "%s/%s/game.apk", DATA_PATH, game_name);
 #endif
+	sprintf(data_path_root, "%s/%s/", DATA_PATH, game_name);
 	sprintf(data_path, "%s/%s/assets/", DATA_PATH, game_name);
 	recursive_mkdir(data_path);
 	
-	strcpy(pkg_name, "com.rinnegatamante.loader");
+	sprintf(gxp_path, "ux0:data/gms/shared/gxp/%s", game_name);
 	sceIoMkdir("ux0:data/gms/shared", 0777);
 	sceIoMkdir("ux0:data/gms/shared/gxp", 0777);
 	sceIoMkdir("ux0:data/gms/shared/glsl", 0777);
+	sceIoMkdir(gxp_path, 0777);
+	strcpy(pkg_name, "com.rinnegatamante.loader");
 
 	// Checking for dependencies
 	if (check_kubridge() < 0)
-		fatal_error("Error kubridge.skprx is not installed.");
+		fatal_error("Error: kubridge.skprx is not installed.");
 	if (!file_exists("ur0:/data/libshacccg.suprx") && !file_exists("ur0:/data/external/libshacccg.suprx"))
-		fatal_error("Error libshacccg.suprx is not installed.");
+		fatal_error("Error: libshacccg.suprx is not installed.");
 	
-	// Loading ARMv7 executable from the apk
+	// Loading shared C++ executable, if present, from the apk
+	GLboolean has_cpp_so = GL_FALSE;
+	GLboolean cpp_warn = GL_FALSE;
 	unz_file_info file_info;
 	unzFile apk_file = unzOpen(apk_path);
 	if (!apk_file)
 		fatal_error("Error could not find %s.", apk_path);
+	int res = unzLocateFile(apk_file, "lib/armeabi-v7a/libc++_shared.so", NULL);
+	if (res == UNZ_OK) {
+		unzGetCurrentFileInfo(apk_file, &file_info, NULL, 0, NULL, 0, NULL, 0);
+		unzOpenCurrentFile(apk_file);
+		uint64_t so_size = file_info.uncompressed_size;
+		uint8_t *so_buffer = (uint8_t *)malloc(so_size);
+		unzReadCurrentFile(apk_file, so_buffer, so_size);
+		unzCloseCurrentFile(apk_file);
+		res = so_mem_load(&cpp_mod, so_buffer, so_size, LOAD_ADDRESS);
+		if (res >= 0) {
+			has_cpp_so = GL_TRUE;
+		} else {
+			cpp_warn = GL_TRUE;
+		}
+		free(so_buffer);
+	}
+	
+	// Loading ARMv7 executable from the apk
 	unzLocateFile(apk_file, "lib/armeabi-v7a/libyoyo.so", NULL);
 	unzGetCurrentFileInfo(apk_file, &file_info, NULL, 0, NULL, 0, NULL, 0);
 	unzOpenCurrentFile(apk_file);
@@ -1998,22 +2637,29 @@ int main(int argc, char **argv)
 	uint8_t *so_buffer = (uint8_t *)malloc(so_size);
 	unzReadCurrentFile(apk_file, so_buffer, so_size);
 	unzCloseCurrentFile(apk_file);
-	int res = so_mem_load(&yoyoloader_mod, so_buffer, so_size, LOAD_ADDRESS);
+	res = so_mem_load(&yoyoloader_mod, so_buffer, so_size, LOAD_ADDRESS + 0x1000000);
 	if (res < 0)
 		fatal_error("Error could not load lib/armeabi-v7a/libyoyo.so from inside game.apk. (Errorcode: 0x%08X)", res);
 	free(so_buffer);
 	
 	// Loading config file
+	char *platforms[] = {
+		"Mob",
+		"Win",
+		"PS4"
+	};
 	loadConfig(game_name);
 	debugPrintf("+--------------------------------------------+\n");
 	debugPrintf("|YoYo Loader Setup                           |\n");
 	debugPrintf("+--------------------------------------------+\n");
 	debugPrintf("|Force GLES1 Mode: %s                         |\n", forceGL1 ? "Y" : "N");
 	debugPrintf("|Skip Splashscreen at Boot: %s                |\n", forceSplashSkip ? "Y" : "N");
-	debugPrintf("|Fake Windows as Platform: %s                 |\n", forceWinMode ? "Y" : "N");
+	debugPrintf("|Platform Target: %s                        |\n", platforms[platTarget]);
+	debugPrintf("|Use Uncached Mem: %s                         |\n", uncached_mem ? "Y" : "N");
 	debugPrintf("|Run with Extended Mem Mode: %s               |\n", maximizeMem ? "Y" : "N");
 	debugPrintf("|Run with Extended Runner Pool: %s            |\n", _newlib_heap_size > 256 * 1024 * 1024 ? "Y" : "N");
 	debugPrintf("|Run with Mem Squeezing: %s                   |\n", squeeze_mem ? "Y" : "N");
+	debugPrintf("|Use Double Buffering: %s                     |\n", double_buffering ? "Y" : "N");
 #ifdef HAS_VIDEO_PLAYBACK_SUPPORT
 	debugPrintf("|Enable Video Player: Y                      |\n");
 #else
@@ -2021,8 +2667,12 @@ int main(int argc, char **argv)
 #endif
 	debugPrintf("|Enable Network Features: %s                  |\n", has_net ? "Y" : "N");
 	debugPrintf("|Force Bilinear Filtering: %s                 |\n", forceBilinear ? "Y" : "N");
-	debugPrintf("|Compress Textures: %s                        |\n", compressTextures ? "Y" : "N");
+	debugPrintf("|Has custom C++ shared lib: %s                |\n", has_cpp_so ? "Y" : "N");
 	debugPrintf("+--------------------------------------------+\n\n\n");
+	
+	if (cpp_warn) {
+		debugPrintf("WARNING: Found libc++_shared.so but failed to load.\n");
+	}
 	
 	if (has_net) {
 		// Init Net
@@ -2056,7 +2706,14 @@ int main(int argc, char **argv)
 		unzReadCurrentFile(apk_file, splash_buf, splash_size);
 		unzCloseCurrentFile(apk_file);
 	}
-	unzClose(apk_file);
+	
+	// Loading cpp library if present
+	if (has_cpp_so) {
+		so_relocate(&cpp_mod);
+		so_resolve(&cpp_mod, default_dynlib, sizeof(default_dynlib), 0);
+		so_flush_caches(&cpp_mod);
+		so_initialize(&cpp_mod);
+	}
 
 	// Patching the executable
 	so_relocate(&yoyoloader_mod);
@@ -2070,8 +2727,26 @@ int main(int argc, char **argv)
 #endif
 	so_flush_caches(&yoyoloader_mod);
 	so_initialize(&yoyoloader_mod);
-	patch_runner_post_init();
 	
+	// Initializing vitaGL
+	vglSetSemanticBindingMode(VGL_MODE_POSTPONED);
+	if (debugMode)
+		vglSetDisplayCallback(mem_profiler);
+	vglSetupGarbageCollector(127, 0x20000);
+	if (squeeze_mem)
+		vglSetParamBufferSize(2 * 1024 * 1024);
+	if (!uncached_mem)
+		vglUseCachedMem(GL_TRUE);
+	if (double_buffering)
+		vglUseTripleBuffering(GL_FALSE);
+	if (maximizeMem)
+		vglInitWithCustomThreshold(0, SCREEN_W, SCREEN_H, MEMORY_VITAGL_THRESHOLD_MB * 1024 * 1024, 0, 0, 0, SCE_GXM_MULTISAMPLE_NONE);
+	else
+		vglInitExtended(0, SCREEN_W, SCREEN_H, MEMORY_VITAGL_THRESHOLD_MB * 1024 * 1024, SCE_GXM_MULTISAMPLE_NONE);
+	vgl_booted = 1;
+	
+	// Applying extra patches to the runner
+	patch_runner_post_init();
 	Function_Add = (void *)so_symbol(&yoyoloader_mod, "_Z12Function_AddPKcPFvR6RValueP9CInstanceS4_iPS1_Eib");
 	if (Function_Add == NULL)
 		Function_Add = (void *)so_symbol(&yoyoloader_mod, "_Z12Function_AddPcPFvR6RValueP9CInstanceS3_iPS0_Eib");
@@ -2079,20 +2754,17 @@ int main(int argc, char **argv)
 	Function_Add("game_end", (intptr_t)game_end, 1, 1);
 	Function_Add("audio_sound_get_track_position", (intptr_t)audio_sound_get_track_position, 1, 1);
 	
-	patch_gamepad(game_name);
-	so_flush_caches(&yoyoloader_mod);
+	//uint8_t *g_fSuppressErrors = (uint8_t *)so_symbol(&yoyoloader_mod, "g_fSuppressErrors");
+	//*g_fSuppressErrors = 1;
 	
-	// Initializing vitaGL
-	if (debugMode)
-		vglSetDisplayCallback(mem_profiler);
-	vglSetupGarbageCollector(127, 0x20000);
-	if (squeeze_mem)
-		vglSetParamBufferSize(2 * 1024 * 1024);
-	if (maximizeMem)
-		vglInitWithCustomThreshold(0, SCREEN_W, SCREEN_H, MEMORY_VITAGL_THRESHOLD_MB * 1024 * 1024, 0, 0, 0, SCE_GXM_MULTISAMPLE_NONE);
-	else
-		vglInitExtended(0, SCREEN_W, SCREEN_H, MEMORY_VITAGL_THRESHOLD_MB * 1024 * 1024, SCE_GXM_MULTISAMPLE_NONE);
-	vgl_booted = 1;
+	patch_gamepad(game_name);
+#ifdef STANDALONE_MODE
+	int has_trophies = trophies_init();
+	if (has_trophies > 0) {
+		patch_trophies();
+	}
+#endif
+	so_flush_caches(&yoyoloader_mod);
 
 	// Initializing Java VM and JNI Interface
 	memset(fake_vm, 'A', sizeof(fake_vm));
@@ -2103,6 +2775,8 @@ int main(int argc, char **argv)
 	memset(fake_env, 'A', sizeof(fake_env));
 	*(uintptr_t *)(fake_env + 0x00) = (uintptr_t)fake_env; // just point to itself...
 	*(uintptr_t *)(fake_env + 0x18) = (uintptr_t)FindClass;
+	*(uintptr_t *)(fake_env + 0x4C) = (uintptr_t)PushLocalFrame;
+	*(uintptr_t *)(fake_env + 0x50) = (uintptr_t)PopLocalFrame;
 	*(uintptr_t *)(fake_env + 0x54) = (uintptr_t)NewGlobalRef;
 	*(uintptr_t *)(fake_env + 0x58) = (uintptr_t)DeleteGlobalRef;
 	*(uintptr_t *)(fake_env + 0x5C) = (uintptr_t)ret0; // DeleteLocalRef
@@ -2116,6 +2790,8 @@ int main(int argc, char **argv)
 	*(uintptr_t *)(fake_env + 0xD4) = (uintptr_t)CallLongMethodV;
 	*(uintptr_t *)(fake_env + 0xEC) = (uintptr_t)CallDoubleMethodV;
 	*(uintptr_t *)(fake_env + 0xF8) = (uintptr_t)CallVoidMethodV;
+	*(uintptr_t *)(fake_env + 0x140) = (uintptr_t)CallNonVirtualIntMethod;
+	*(uintptr_t *)(fake_env + 0x170) = (uintptr_t)CallNonVirtualVoidMethod;
 	*(uintptr_t *)(fake_env + 0x178) = (uintptr_t)GetFieldID;
 	*(uintptr_t *)(fake_env + 0x17C) = (uintptr_t)GetBooleanField;
 	*(uintptr_t *)(fake_env + 0x190) = (uintptr_t)GetIntField;
@@ -2135,16 +2811,20 @@ int main(int argc, char **argv)
 	*(uintptr_t *)(fake_env + 0x2AC) = (uintptr_t)GetArrayLength;
 	*(uintptr_t *)(fake_env + 0x2B0) = (uintptr_t)NewObjectArray;
 	*(uintptr_t *)(fake_env + 0x2B8) = (uintptr_t)SetObjectArrayElement;
+	*(uintptr_t *)(fake_env + 0x2C0) = (uintptr_t)NewCharArray;
 	*(uintptr_t *)(fake_env + 0x2CC) = (uintptr_t)NewIntArray;
 	*(uintptr_t *)(fake_env + 0x2D8) = (uintptr_t)NewDoubleArray;
 	*(uintptr_t *)(fake_env + 0x320) = (uintptr_t)GetByteArrayRegion;
 	*(uintptr_t *)(fake_env + 0x34C) = (uintptr_t)SetIntArrayRegion;
 	*(uintptr_t *)(fake_env + 0x358) = (uintptr_t)SetDoubleArrayRegion;
 	*(uintptr_t *)(fake_env + 0x36C) = (uintptr_t)GetJavaVM;
+	*(uintptr_t *)(fake_env + 0x378) = (uintptr_t)GetPrimitiveArrayCritical;
+	*(uintptr_t *)(fake_env + 0x37C) = (uintptr_t)ReleasePrimitiveArrayCritical;
 	*(uintptr_t *)(fake_env + 0x394) = (uintptr_t)NewWeakGlobalRef;
 	
-	int (*Java_com_yoyogames_runner_RunnerJNILib_Startup) (void *env, int a2, char *apk_path, char *save_dir, char *pkg_dir, int sleep_margin) = (void *)so_symbol(&yoyoloader_mod, "Java_com_yoyogames_runner_RunnerJNILib_Startup");
+	void (*Java_com_yoyogames_runner_RunnerJNILib_Startup) (void *env, int a2, char *apk_path, char *save_dir, char *pkg_dir, int sleep_margin) = (void *)so_symbol(&yoyoloader_mod, "Java_com_yoyogames_runner_RunnerJNILib_Startup");
 	Java_com_yoyogames_runner_RunnerJNILib_CreateVersionDSMap = (void *)so_symbol(&yoyoloader_mod, "Java_com_yoyogames_runner_RunnerJNILib_CreateVersionDSMap");
+	Java_com_yoyogames_runner_RunnerJNILib_TouchEvent  = (void *)so_symbol(&yoyoloader_mod, "Java_com_yoyogames_runner_RunnerJNILib_TouchEvent");
 	
 	// Displaying splash screen
 	if (splash_buf) {
@@ -2154,7 +2834,7 @@ int main(int argc, char **argv)
 		glGenTextures(1, &bg_image);
 		glBindTexture(GL_TEXTURE_2D, bg_image);
 		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, bg_data);
-		free(bg_data);
+		vglFree(bg_data);
 		free(splash_buf);
 		glEnable(GL_TEXTURE_2D);
 		glEnableClientState(GL_VERTEX_ARRAY);
@@ -2179,6 +2859,32 @@ int main(int argc, char **argv)
 		glDisableClientState(GL_TEXTURE_COORD_ARRAY);
 		vglSwapBuffers(GL_FALSE);
 		glDeleteTextures(1, &bg_image);
+	}
+	
+	// Extracting Game ID
+	char game_id[256];
+	void *tmp_buf = malloc(32 * 1024 * 1024);
+	unzLocateFile(apk_file, "assets/game.droid", NULL);
+	unzOpenCurrentFile(apk_file);
+	unzReadCurrentFile(apk_file, tmp_buf, 20);
+	uint32_t offs;
+	unzReadCurrentFile(apk_file, &offs, 4);
+	uint32_t target = offs - 28;
+	while (target > 32 * 1024 * 1024) {
+		unzReadCurrentFile(apk_file, tmp_buf, 32 * 1024 * 1024);
+		target -= 32 * 1024 * 1024;
+	}
+	unzReadCurrentFile(apk_file, tmp_buf, target);
+	unzReadCurrentFile(apk_file, &offs, 4);
+	unzReadCurrentFile(apk_file, game_id, offs + 1);
+	unzClose(apk_file);
+	free(tmp_buf);
+	debugPrintf("Detected %s as Game ID\n", game_id);
+	
+	// Enabling game specific gamehacks
+	if (!strcmp(game_id, "DELTARUNE")) {
+		debugPrintf("Enabling Deltarune specific gamehack!\n");
+		deltarune_hack = 1;
 	}
 	
 	// Starting the Runner

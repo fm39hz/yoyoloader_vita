@@ -8,7 +8,7 @@
 extern so_module yoyoloader_mod;
 
 #if 0
-#define debugPrintf printf
+#define debugPrintf sceClibPrintf
 #else
 int debugPrintf(char *text, ...);
 #endif
@@ -56,5 +56,11 @@ typedef struct retval_t {
 	int flags;
 	retval_type kind;
 } retval_t;
+
+enum {
+	TOUCH_DOWN,
+	TOUCH_UP,
+	TOUCH_MOVE
+};
 
 #endif

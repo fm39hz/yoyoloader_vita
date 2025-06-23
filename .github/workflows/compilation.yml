@@ -17,14 +17,27 @@ jobs:
       run: |
         cp stubs/libkubridge_stub.a /home/user/vitasdk/arm-vita-eabi/lib
         cp stubs/libkubridge_stub_weak.a /home/user/vitasdk/arm-vita-eabi/lib
+        cp libs/libsndfile.a /home/user/vitasdk/arm-vita-eabi/lib
+        cp libs/libcurl.a /home/user/vitasdk/arm-vita-eabi/lib
+        cp libs/libssl.a /home/user/vitasdk/arm-vita-eabi/lib
+        cp libs/libcrypto.a /home/user/vitasdk/arm-vita-eabi/lib
         git clone -b vgl --single-branch https://github.com/Rinnegatamante/openal-soft.git
         cd openal-soft/build
         cmake -DCMAKE_TOOLCHAIN_FILE=${VITASDK}/share/vita.toolchain.cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS=-mfloat-abi=softfp .. && make -j$(nproc) install
         cd ../..
+        git clone https://github.com/bythos14/SceShaccCgExt.git
+        cd SceShaccCgExt
+        mkdir build && cd build
+        cmake .. && make -j$(nproc) install
+        cd ../..
         git clone https://github.com/Rinnegatamante/vitaShaRK.git
         make -C vitaShaRK -j$(nproc) install
         git clone https://github.com/Rinnegatamante/vitaGL.git
-        make -C vitaGL SOFTFP_ABI=1 NO_DEBUG=1 SAMPLER_UNIFORMS=1 CACHED_MEM=1 -j$(nproc) install
+        make -C vitaGL SOFTFP_ABI=1 NO_DEBUG=1 SHARED_RENDERTARGETS=1 HAVE_GLSL_SUPPORT=1 -j$(nproc) install
+        git clone https://github.com/frangarcj/opensles.git
+        cd opensles/libopensles
+        make -j$(nproc) install
+        cd ../..
     - name: Compile project
       run: |
         git config --global --add safe.directory /__w/yoyoloader_vita/yoyoloader_vita
@@ -42,8 +55,8 @@ jobs:
         cmake -DLOADER=1 -DSTANDALONE=1 ..
         make -j$(nproc)
         cd ..
-        make -C vitaGL SOFTFP_ABI=1 NO_DEBUG=1 SAMPLER_UNIFORMS=1 CACHED_MEM=1 PHYCONT_ON_DEMAND=1 -j$(nproc) clean
-        make -C vitaGL SOFTFP_ABI=1 NO_DEBUG=1 SAMPLER_UNIFORMS=1 CACHED_MEM=1 PHYCONT_ON_DEMAND=1 -j$(nproc) install
+        make -C vitaGL SOFTFP_ABI=1 NO_DEBUG=1 PHYCONT_ON_DEMAND=1 SHARED_RENDERTARGETS=1 HAVE_GLSL_SUPPORT=1 -j$(nproc) clean
+        make -C vitaGL SOFTFP_ABI=1 NO_DEBUG=1 PHYCONT_ON_DEMAND=1 SHARED_RENDERTARGETS=1 HAVE_GLSL_SUPPORT=1 -j$(nproc) install
         cd standalone_video
         cmake -DLOADER=1 -DVIDEO_SUPPORT=1 -DSTANDALONE=1 ..
         make -j$(nproc)

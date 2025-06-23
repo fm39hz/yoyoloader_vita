@@ -1,9 +1,12 @@
 #include <vitasdk.h>
 #include <vitaGL.h>
 #include <imgui_vita.h>
+#include <imgui_internal.h>
+#include <bzlib.h>
 #include <curl/curl.h>
 #include <stdio.h>
 #include <string>
+#include <sndfile.h>
 #include "../loader/zip.h"
 #include "../loader/unzip.h"
 #include "strings.h"
@@ -11,6 +14,9 @@
 #define STB_IMAGE_IMPLEMENTATION
 #define STB_ONLY_PNG
 #include "../loader/stb_image.h"
+
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"
 
 #define DATA_PATH "ux0:data/gms"
 #define LAUNCH_FILE_PATH DATA_PATH "/launch.txt"
@@ -22,8 +28,8 @@
 #define stringify(x) FUNC_TO_NAME(x)
 #define MIN(x, y) (x) < (y) ? (x) : (y)
 
-#define NUM_OPTIONS 12
-#define NUM_DB_CHUNKS 3
+#define NUM_OPTIONS 14
+#define NUM_DB_CHUNKS 11
 #define MEM_BUFFER_SIZE (32 * 1024 * 1024)
 #define FILTER_MODES_NUM 6
 
@@ -44,6 +50,8 @@ int init_interactive_msg_dialog(const char *msg) {
 
 enum {
 	SCE_SYSTEM_PARAM_LANG_UKRAINIAN = 20,
+	SCE_SYSTEM_PARAM_LANG_CZECH = 21,
+	SCE_SYSTEM_PARAM_LANG_RYUKYUAN = 22
 };
 
 extern void video_open(const char *path);
@@ -53,6 +61,7 @@ extern void video_close();
 extern "C" {
 	int debugPrintf(const char *fmt, ...) {return 0;}
 	void fatal_error(const char *fmt, ...);
+	extern int runner_loaded;
 };
 
 void DrawDownloaderDialog(int index, float downloaded_bytes, float total_bytes, char *text, int passes, bool self_contained);
@@ -70,6 +79,7 @@ enum {
 
 int _newlib_heap_size_user = 256 * 1024 * 1024;
 
+static volatile bool has_pvr = false;
 static CURL *curl_handle = NULL;
 static volatile uint64_t total_bytes = 0xFFFFFFFF;
 static volatile uint64_t downloaded_bytes = 0;
@@ -79,7 +89,7 @@ static bool needs_extended_font = false;
 uint8_t *generic_mem_buffer = nullptr;
 static FILE *fh;
 char *bytes_string;
-SceUID banner_thid;
+SceUID banner_thid, gl_mutex;
 int console_language;
 
 struct CompatibilityList {
@@ -99,8 +109,7 @@ struct GameSelection {
 	bool bilinear;
 	bool gles1;
 	bool skip_splash;
-	bool compress_textures;
-	bool fake_win_mode;
+	int plat_target;
 	bool debug_mode;
 	bool debug_shaders;
 	bool mem_extended;
@@ -108,6 +117,9 @@ struct GameSelection {
 	bool video_support;
 	bool has_net;
 	bool squeeze_mem;
+	bool no_audio;
+	bool uncached_mem;
+	bool double_buffering;
 	CompatibilityList *status;
 	GameSelection *next;
 };
@@ -178,38 +190,48 @@ void AppendCompatibilityDatabase(const char *file) {
 					bool perform_slow_check = true;
 					ptr += 1000; // Let's skip some data to improve performances
 					ptr = strstr(ptr, "\"labels\":");
+					char *old_ptr = ptr;
 					ptr = strstr(ptr + 150, "\"name\":");
-					ptr += 9;
-					if (ptr[0] == 'P') {
-						node->playable = true;
-						node->ingame_low = false;
-						node->ingame_plus = false;
-						node->crash = false;
-					} else if (ptr[0] == 'C') {
-						node->playable = false;
-						node->ingame_low = false;
-						node->ingame_plus = false;
-						node->slow = false;
-						node->crash = true;
-						perform_slow_check = false;
-					} else {
-						node->playable = false;
-						node->crash = false;
-						end = strstr(ptr, "\"");
-						if ((end - ptr) == 13) {
-							node->ingame_plus = true;
+					if (ptr) {
+						ptr += 9;
+						if (ptr[0] == 'P') {
+							node->playable = true;
 							node->ingame_low = false;
-						}else {
-							node->ingame_low = true;
 							node->ingame_plus = false;
+							node->crash = false;
+						} else if (ptr[0] == 'C') {
+							node->playable = false;
+							node->ingame_low = false;
+							node->ingame_plus = false;
+							node->slow = false;
+							node->crash = true;
+							perform_slow_check = false;
+						} else {
+							node->playable = false;
+							node->crash = false;
+							end = strstr(ptr, "\"");
+							if ((end - ptr) == 13) {
+								node->ingame_plus = true;
+								node->ingame_low = false;
+							}else {
+								node->ingame_low = true;
+								node->ingame_plus = false;
+							}
 						}
-					}
-					ptr += 120; // Let's skip some data to improve performances
-					if (perform_slow_check) {
-						end = ptr;
-						ptr = strstr(ptr, "]");
-						if ((ptr - end) > 200) node->slow = true;
-						else node->slow = false;
+						ptr += 120; // Let's skip some data to improve performances
+						if (perform_slow_check) {
+							end = ptr;
+							ptr = strstr(ptr, "]");
+							if ((ptr - end) > 200) node->slow = true;
+							else node->slow = false;
+						}
+					} else {
+						ptr = old_ptr;
+						node->playable = false;
+						node->ingame_low = false;
+						node->ingame_plus = false;
+						node->crash = false;
+						node->slow = false;
 					}
 				
 					ptr += 350; // Let's skip some data to improve performances
@@ -250,6 +272,19 @@ void *__wrap_memset(void *s, int c, size_t n) {
 }
 }
 
+void recursive_mkdir(char *dir) {
+	char *p = dir;
+	while (p) {
+		char *p2 = strstr(p, "/");
+		if (p2) {
+			p2[0] = 0;
+			sceIoMkdir(dir, 0777);
+			p = p2 + 1;
+			p2[0] = '/';
+		} else break;
+	}
+}
+
 static size_t write_cb(void *ptr, size_t size, size_t nmemb, void *stream)
 {
 	uint8_t *dst = &generic_mem_buffer[downloaded_bytes];
@@ -281,7 +316,7 @@ static void startDownload(const char *url)
 	curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, write_cb);
 	curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, bytes_string); // Dummy
 	curl_easy_setopt(curl_handle, CURLOPT_HEADERFUNCTION, header_cb);
-	curl_easy_setopt(curl_handle, CURLOPT_HEADERDATA, bytes_string); // Dummy*/
+	curl_easy_setopt(curl_handle, CURLOPT_HEADERDATA, bytes_string); // Dummy
 	curl_easy_setopt(curl_handle, CURLOPT_RESUME_FROM, downloaded_bytes);
 	curl_easy_setopt(curl_handle, CURLOPT_BUFFERSIZE, 524288);
 	struct curl_slist *headerchunk = NULL;
@@ -312,9 +347,9 @@ void loadConfig(GameSelection *g) {
 		while (EOF != fscanf(config, "%[^=]=%d\n", buffer, &value)) {
 			if (strcmp("forceGLES1", buffer) == 0) g->gles1 = (bool)value;
 			else if (strcmp("forceBilinear", buffer) == 0) g->bilinear = (bool)value;
-			else if (strcmp("winMode", buffer) == 0) g->fake_win_mode = (bool)value;
+			else if (strcmp("winMode", buffer) == 0) g->plat_target = 1; // Retro compatibility
+			else if (strcmp("platTarget", buffer) == 0) g->plat_target = value;
 			else if (strcmp("debugShaders", buffer) == 0) g->debug_shaders = (bool)value;
-			else if (strcmp("compressTextures", buffer) == 0) g->compress_textures = (bool)value;
 			else if (strcmp("debugMode", buffer) == 0) g->debug_mode = (bool)value;
 			else if (strcmp("noSplash", buffer) == 0) g->skip_splash = (bool)value;
 			else if (strcmp("maximizeMem", buffer) == 0) g->mem_extended = (bool)value;
@@ -322,6 +357,9 @@ void loadConfig(GameSelection *g) {
 			else if (strcmp("videoSupport", buffer) == 0) g->video_support = (bool)value;
 			else if (strcmp("netSupport", buffer) == 0) g->has_net = (bool)value;
 			else if (strcmp("squeezeMem", buffer) == 0) g->squeeze_mem = (bool)value;
+			else if (strcmp("disableAudio", buffer) == 0) g->no_audio = (bool)value;
+			else if (strcmp("doubleBuffering", buffer) == 0) g->double_buffering = (bool)value;
+			else if (strcmp("uncachedMem", buffer) == 0) g->uncached_mem = (bool)value;
 		}
 		fclose(config);
 	} else {
@@ -402,7 +440,9 @@ bool calculate_ver_len = true;
 bool is_config_invoked = false;
 uint32_t oldpad;
 bool extracting = false;
+bool externalizing = false;
 
+volatile int cur_step = 0;
 volatile int cur_idx = 0;
 volatile int tot_idx = -1;
 volatile float saved_size = -1.0f;
@@ -426,7 +466,7 @@ int optimizer_thread(unsigned int argc, void *argv) {
 	tot_idx = global_info.number_entry;
 	for (uint32_t zip_idx = 0; zip_idx < global_info.number_entry; ++zip_idx) {
 		unzGetCurrentFileInfo(src_file, &file_info, fname, 512, NULL, 0, NULL, 0);
-		if ((strstr(fname, "assets/") && fname[strlen(fname) - 1] != '/') || !strcmp(fname, "lib/armeabi-v7a/libyoyo.so")) {
+		if ((strstr(fname, "assets/") && fname[strlen(fname) - 1] != '/') || (strstr(fname, "res/raw") && fname[strlen(fname) - 1] != '/') || !strcmp(fname, "lib/armeabi-v7a/libyoyo.so") || !strcmp(fname, "lib/armeabi-v7a/libc++_shared.so")) {
 			if (strstr(fname, ".ogg") || strstr(fname, ".mp4")) {
 				zipOpenNewFileInZip(dst_file, fname, NULL, NULL, 0, NULL, 0, NULL, 0, Z_NO_COMPRESSION);
 			} else {
@@ -473,6 +513,604 @@ int optimizer_thread(unsigned int argc, void *argv) {
 	return sceKernelExitDeleteThread(0);
 }
 
+typedef struct {
+	char fname[256];
+	uint32_t group_idx;
+	uint32_t idx;
+} snd;
+uint32_t snd_num;
+uint32_t txtr_num;
+snd sounds[8192];
+uint32_t null_ref = 0xFFFFFFFF;
+uint32_t regular_file_flag = 0x64;
+
+// Taken from https://github.com/libsndfile/libsndfile/blob/master/programs/common.c
+int sfe_copy_data_fp(SNDFILE *outfile, SNDFILE *infile, int channels, int normalize) {
+	static double	data [4096], max ;
+	sf_count_t	 frames, readcount, k ;
+
+	frames = 4096 / channels ;
+	readcount = frames ;
+
+	sf_command (infile, SFC_CALC_SIGNAL_MAX, &max, sizeof (max)) ;
+	if (!isnormal (max)) /* neither zero, subnormal, infinite, nor NaN */
+		return 1 ;
+
+	if (!normalize && max < 1.0)
+	{	
+		while (readcount > 0) {
+			readcount = sf_readf_double (infile, data, frames) ;
+			sf_writef_double (outfile, data, readcount) ;
+		}
+	}
+	else
+	{	
+		sf_command (infile, SFC_SET_NORM_DOUBLE, NULL, SF_FALSE) ;
+		while (readcount > 0) {
+			readcount = sf_readf_double (infile, data, frames) ;
+			for (k = 0 ; k < readcount * channels ; k++) {
+				data [k] /= max ;
+				if (!isfinite (data [k])) /* infinite or NaN */
+					return 1 ;
+			}
+			sf_writef_double (outfile, data, readcount) ;
+		}
+	}
+
+	return 0;
+}
+
+void populateSoundsTable(FILE *f) {
+	uint32_t total_size;
+	uint32_t size;
+	uint32_t entries;
+	char chunk_name[5];
+	chunk_name[4] = 0;
+	fseek(f, 4, SEEK_SET);
+	fread(&total_size, 1, 4, f);
+	//printf("Total Size: %u\n", total_size);
+	while (!feof(f)) {
+		uint32_t base_off = ftell(f);
+		int bytes = fread(chunk_name, 1, 4, f);
+		if (!bytes)
+			break;
+		fread(&size, 1, 4, f);
+		//printf("Chunk %s with size %u\n", chunk_name, size);
+		if (!strcmp(chunk_name, "SOND")) {
+			uint32_t start = ftell(f);
+			fread(&entries, 1, 4, f);
+			//printf("Sound entries: %u\n", entries);
+			for (int i = 0; i < entries; i++) {
+				uint32_t fname_offset;
+				fread(&fname_offset, 1, 4, f);
+				uint32_t backup = ftell(f);
+				fseek(f, fname_offset + 4, SEEK_SET);
+				uint32_t entry_start = ftell(f);
+				fflush(f);
+				fwrite(&regular_file_flag, 1, 4, f);
+				fseek(f, 4, SEEK_CUR);
+				fread(&fname_offset, 1, 4, f);
+				fseek(f, 12, SEEK_CUR);
+				fread(&sounds[i].group_idx, 1, 4, f);
+				fread(&sounds[i].idx, 1, 4, f);
+				fseek(f, entry_start + 28, SEEK_SET);
+				fwrite(&null_ref, 1, 4, f);
+				fseek(f, fname_offset, SEEK_SET);
+				int z = 0;
+				do {
+					fread(&sounds[i].fname[z++], 1, 1, f);
+				} while (sounds[i].fname[z - 1]);
+				fseek(f, backup, SEEK_SET);
+			}
+			snd_num = entries;
+			fseek(f, start, SEEK_SET);
+			fseek(f, size, SEEK_CUR);
+		} else {
+			fseek(f, size, SEEK_CUR);
+		}
+	}
+	fclose(f);
+}
+
+extern "C" {
+	void *decode_qoi(void *buffer, int size, int *w, int *h);
+};
+
+GLuint ext_texture;
+void dump_pvr_texture(const char *fname, void *buf, int w, int h) {
+	sceKernelWaitSema(gl_mutex, 1, NULL);
+	glBindTexture(GL_TEXTURE_2D, ext_texture);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_COMPRESSED_RGBA_S3TC_DXT5_EXT, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, buf);
+	free(buf);
+	buf = vglGetTexDataPointer(GL_TEXTURE_2D);
+	sceKernelSignalSema(gl_mutex, 1);
+	uint32_t buf_size = ceil(w / 4.0) * ceil(h / 4.0) * 16;
+	FILE *f2 = fopen(fname, "wb+");
+	uint32_t val = 0x03525650;
+	uint64_t format = 0x0B; // DXT5
+	fwrite(&val, 1, 4, f2);
+	val = 0;
+	fwrite(&val, 1, 4, f2);
+	fwrite(&format, 1, 8, f2);
+	fwrite(&val, 1, 4, f2);
+	fwrite(&val, 1, 4, f2);
+	fwrite(&h, 1, 4, f2);
+	fwrite(&w, 1, 4, f2);
+	val = 1;
+	fwrite(&val, 1, 4, f2);
+	fwrite(&val, 1, 4, f2);
+	fwrite(&val, 1, 4, f2);
+	fwrite(&val, 1, 4, f2);
+	val = 4;
+	fwrite(&val, 1, 4, f2);
+	val = 0x03525650;
+	fwrite(&val, 1, 4, f2);
+	fwrite(buf, 1, buf_size, f2);
+	fclose(f2);
+}
+
+void externalizeSoundsAndTextures(FILE *f, int audiogroup_idx, zipFile dst_file, const char *assets_path) {
+	glGenTextures(1, &ext_texture);
+	uint32_t total_size;
+	uint32_t size;
+	uint32_t entries;
+	char chunk_name[5];
+	chunk_name[4] = 0;
+	fseek(f, 4, SEEK_SET);
+	fread(&total_size, 1, 4, f);
+	//printf("Total Size: %u\n", total_size);
+	while (!feof(f)) {
+		int bytes = fread(chunk_name, 1, 4, f);
+		if (!bytes)
+			break;
+		fread(&size, 1, 4, f);
+		//printf("Chunk %s with size %u\n", chunk_name, size);
+		if (!strcmp(chunk_name, "AUDO")) {
+			uint32_t start = ftell(f);
+			char fname[256], fname2[256], fname3[128];
+			fread(&entries, 1, 4, f);
+			//printf("There are %u sounds\n", entries);
+			uint32_t *offsets = (uint32_t *)malloc((entries + 1) * sizeof(uint32_t));
+			offsets[entries] = ftell(f) - 4 + size;
+			for (int i = 0; i < entries; i++) {
+				fread(&offsets[i], 1, 4, f);
+				offsets[i] += 4;
+			}
+			tot_idx = entries;
+			for (int i = 0; i < entries; i++) {
+				cur_idx = i;
+				uint8_t found = 0;
+				//printf("Processing sound #%d\n", i);
+				for (int j = 0; j < snd_num; j++) {
+					if (i == sounds[j].idx && sounds[j].group_idx == audiogroup_idx) {
+						recursive_mkdir(fname2);
+						sprintf(fname, "ux0:data/gms/shared/tmp/%d.wav", j);
+						sprintf(fname2, "%s/%s", assets_path, sounds[j].fname);
+						sprintf(fname3, "assets/%s", sounds[j].fname);
+						//printf("Dumping %s\n", fname);
+						found = 1;
+						break;
+					}
+				}
+				if (found) { // Skipping externalized sounds
+					FILE *f2 = fopen(fname, "wb+");
+					uint32_t snd_size = offsets[i + 1] - offsets[i];
+					void *buf = malloc(snd_size);
+					fseek(f, offsets[i], SEEK_SET);
+					fread(buf, 1, snd_size, f);
+					fwrite(buf, 1, snd_size, f2);
+					fclose(f2);
+					if (!strncmp((char *)buf, "OggS", 4)) {
+						sceIoRename(fname, fname2);
+					} else {
+						//printf("Transcoding %s to %s\n", fname, fname2);
+						SF_INFO sfinfo;
+						SNDFILE *in = sf_open(fname, SFM_READ, &sfinfo);
+						sfinfo.format = SF_FORMAT_OGG | SF_FORMAT_VORBIS | SF_ENDIAN_FILE;
+						SNDFILE *out = sf_open(fname2, SFM_WRITE, &sfinfo);
+						sfe_copy_data_fp(out, in, sfinfo.channels, 0);
+						sf_close(in);
+						sf_close(out);
+						sceIoRemove(fname);
+					}
+					free(buf);
+					zipOpenNewFileInZip(dst_file, fname3, NULL, NULL, 0, NULL, 0, NULL, 0, Z_NO_COMPRESSION);
+					zipCloseFileInZip(dst_file);
+				}
+			}
+			free(offsets);
+			fseek(f, start, SEEK_SET);
+			fseek(f, size, SEEK_CUR);
+		} else if (!strcmp(chunk_name, "TXTR")) {
+			uint32_t start = ftell(f);
+			char fname[256];
+			fread(&entries, 1, 4, f);
+			txtr_num = entries;
+			uint32_t *offsets = (uint32_t *)malloc((entries + 1) * sizeof(uint32_t));
+			offsets[entries] = ftell(f) - 4 + size;
+			for (int i = 0; i < entries; i++) {
+				fread(&offsets[i], 1, 4, f);
+				uint32_t backup = ftell(f);
+				fseek(f, offsets[i] + 4, SEEK_SET);
+				uint32_t extra;
+				fread(&extra, 1, 4, f);
+				if (!extra)
+					fread(&offsets[i], 1, 4, f);
+				else
+					offsets[i] = extra;
+				fseek(f, backup, SEEK_SET);
+			}
+			tot_idx = entries;
+			for (int i = 0; i < entries; i++) {
+				cur_idx = i;
+				sprintf(fname, "%s/%d.%s", assets_path, i, has_pvr ? "pvr" : "png");
+				fseek(f, offsets[i], SEEK_SET);
+				fread(generic_mem_buffer, 1, offsets[i + 1] - offsets[i], f);
+				uint32_t *buffer32 = (uint32_t *)generic_mem_buffer;
+				uint32_t buf_size;
+				void *buf;
+				int w, h;
+				FILE *f2;
+				switch (*buffer32) {
+				case 0x716F7A32: // Bzip2 + Qoi
+				case 0x716F6966: // Qoi
+					buf = decode_qoi(generic_mem_buffer, offsets[i + 1] - offsets[i], &w, &h);
+					if (has_pvr) {
+						dump_pvr_texture(fname, buf, w, h);
+					} else {
+						stbi_write_png(fname, w, h, 4, buf, w * 4);
+						free(buf);
+					}
+					break;
+				default: // Png
+					if (offsets[i + 1] - offsets[i] != 76) { // Skipping already externalized textures
+						if (has_pvr) {
+							int dummy;
+							buf = stbi_load_from_memory(generic_mem_buffer, offsets[i + 1] - offsets[i], &w, &h, NULL, 4);
+							dump_pvr_texture(fname, buf, w, h);
+						} else {
+							f2 = fopen(fname, "wb+");
+							fwrite(generic_mem_buffer, 1, offsets[i + 1] - offsets[i], f2);
+							fclose(f2);
+						}
+					}
+					break;
+				}
+			}
+			free(offsets);
+			fseek(f, start, SEEK_SET);
+			fseek(f, size, SEEK_CUR);
+		} else {
+			fseek(f, size, SEEK_CUR);
+		}
+	}
+	fclose(f);
+	glDeleteTextures(1, &ext_texture);
+}
+
+void patchForExternalization(FILE *in, FILE *out) {
+	uint32_t start_offset = 0;
+	uint32_t total_size;
+	uint32_t size;
+	uint32_t entries;
+	uint8_t has_txtr_chunk = 0;
+	char chunk_name[5];
+	chunk_name[4] = 0;
+	fseek(in, 4, SEEK_SET);
+	fread(&total_size, 1, 4, in);
+	//printf("Total Size: %u\n", total_size);
+	while (!feof(in)) {
+		int bytes = fread(chunk_name, 1, 4, in);
+		if (!bytes)
+			break;
+		fread(&size, 1, 4, in);
+		//printf("Chunk %s with size %u\n", chunk_name, size);
+		if (!strcmp(chunk_name, "AUDO")) {
+			if (has_txtr_chunk) {
+				fwrite(chunk_name, 1, 4, out);
+				fread(&entries, 1, 4, in);
+			} else {
+				int pre_audo_size = ftell(in) - 4;
+				fread(&entries, 1, 4, in);
+				fseek(in, 0, SEEK_SET);
+				uint32_t executed_bytes = 0;
+				while (executed_bytes < pre_audo_size) {
+					uint32_t read_size = (pre_audo_size - executed_bytes) > MEM_BUFFER_SIZE ? MEM_BUFFER_SIZE : (pre_audo_size - executed_bytes);
+					fread(generic_mem_buffer, 1, read_size, in);
+					fwrite(generic_mem_buffer, 1, read_size, out);
+					executed_bytes += read_size;
+				}
+			}
+			uint32_t new_audo_size = 4 + entries * 12;
+			fwrite(&new_audo_size, 1, 4, out);
+			fwrite(&entries, 1, 4, out);
+			uint32_t base_offs = ftell(out) + entries * 4;
+			for (int i = 0; i < entries; i++) {
+				uint32_t entry_offs = base_offs + i * 8;
+				fwrite(&entry_offs, 1, 4, out);
+			}
+			uint64_t one_long = 1;
+			for (int i = 0; i < entries; i++) {
+				fwrite(&one_long, 1, 8, out);
+			}
+			uint32_t full_size = ftell(out) - 8;
+			fseek(out, 4, SEEK_SET);
+			fwrite(&full_size, 1, 4, out);
+			break;
+		} else if (!strcmp(chunk_name, "TXTR")) {
+			has_txtr_chunk = 1;
+			uint32_t start = ftell(in);
+			int pre_txtr_size = ftell(in) - 4;
+			fread(&entries, 1, 4, in);
+			uint32_t first_offset;
+			fread(&first_offset, 1, 4, in);
+			fseek(in, first_offset + 4, SEEK_SET);
+			uint32_t extra;
+			fread(&extra, 1, 4, in);
+			if (!extra)
+				fread(&first_offset, 1, 4, in);
+			else
+				first_offset = extra;
+			fseek(in, 0, SEEK_SET);
+			uint32_t executed_bytes = 0;
+			while (executed_bytes < pre_txtr_size) {
+				uint32_t read_size = (pre_txtr_size - executed_bytes) > MEM_BUFFER_SIZE ? MEM_BUFFER_SIZE : (pre_txtr_size - executed_bytes);
+				fread(generic_mem_buffer, 1, read_size, in);
+				fwrite(generic_mem_buffer, 1, read_size, out);
+				executed_bytes += read_size;
+			}
+			uint32_t new_txtr_size = (first_offset - (pre_txtr_size + 4)) + entries * 76;
+			fwrite(&new_txtr_size, 1, 4, out);
+			fwrite(&entries, 1, 4, out);
+			fseek(in, pre_txtr_size + 8, SEEK_SET);
+			fread(generic_mem_buffer, 1, entries * 4, in);
+			fwrite(generic_mem_buffer, 1, entries * 4, out);
+			uint32_t *buffer32 = (uint32_t *)generic_mem_buffer;
+			uint32_t has_extra;
+			for (int i = 0; i < entries; i++) {
+				has_extra = 0;
+				fseek(in, buffer32[i], SEEK_SET);
+				fread(&extra, 1, 4, in);
+				fwrite(&extra, 1, 4, out);
+				fread(&extra, 1, 4, in);
+				if (!extra) {
+					fwrite(&extra, 1, 4, out);
+					has_extra = 1;
+				}
+				extra = first_offset + i * 76;
+				fwrite(&extra, 1, 4, out);
+			}
+			if (has_extra)
+				fseek(in, 4, SEEK_CUR);
+			uint32_t cur_pos = ftell(in);
+			if (cur_pos < first_offset) {
+				//printf("%u bytes of padding required\n", first_offset - cur_pos);
+				fread(generic_mem_buffer, 1, first_offset - cur_pos, in);
+				fwrite(generic_mem_buffer, 1, first_offset - cur_pos, out);
+			}
+			uint32_t img_data[2];
+			img_data[0] = 0xFFBEADDE;
+			img_data[1] = 0xFF000000;
+			uint16_t padding = 0;
+			for (int i = 0; i < entries; i++) {
+				int out_len;
+				unsigned char *placeholder = stbi_write_png_to_mem((unsigned char *)img_data, 8, 2, 1, 4, &out_len);
+				fwrite(placeholder, 1, 74, out);
+				fwrite(&padding, 1, 2, out);
+				img_data[1]++;
+			}
+			fseek(in, start, SEEK_SET);
+			fseek(in, size, SEEK_CUR);
+		} else {
+			fseek(in, size, SEEK_CUR);
+		}
+	}
+	fclose(in);
+	fclose(out);
+}
+
+bool isExternalizedSound(char *fname) {
+	char *s = strstr(fname, "assets/");
+	if (s) {
+		fname = s + 7;
+		for (int j = 0; j < snd_num; j++) {
+			if (sounds[j].idx == null_ref && !strcmp(fname, sounds[j].fname))
+				return true;
+		}
+	}
+	return false;
+}
+
+int externalizer_thread(unsigned int argc, void *argv) {
+	int has_runner_extracted = 0;
+	cur_step = 0;
+	char *game = (char *)argv;
+	char apk_path[256], tmp_path[256], fname[512], fname2[512], assets_path[256];
+	sprintf(apk_path, "ux0:data/gms/%s/game.apk", game);
+	sprintf(tmp_path, "ux0:data/gms/%s/game.tmp", game);
+	sprintf(assets_path, "ux0:data/gms/%s/assets", game);
+	sceIoMkdir(assets_path, 0777);
+	
+	SceIoStat stat;
+	sceIoGetstat(apk_path, &stat);
+	uint32_t orig_size = stat.st_size;
+	
+	unz_global_info global_info;
+	unz_file_info file_info;
+	unzFile src_file = unzOpen(apk_path);
+	unzGetGlobalInfo(src_file, &global_info);
+	unzLocateFile(src_file, "assets/game.droid", NULL);
+	unzGetCurrentFileInfo(src_file, &file_info, fname, 512, NULL, 0, NULL, 0);
+	unzOpenCurrentFile(src_file);
+	sceIoMkdir("ux0:data/gms/shared/tmp", 0777);
+	FILE *f = fopen("ux0:data/gms/shared/tmp/tmp.droid", "wb");
+	uint32_t executed_bytes = 0;
+	while (executed_bytes < file_info.uncompressed_size) {
+		uint32_t read_size = (file_info.uncompressed_size - executed_bytes) > MEM_BUFFER_SIZE ? MEM_BUFFER_SIZE : (file_info.uncompressed_size - executed_bytes);
+		unzReadCurrentFile(src_file, generic_mem_buffer, read_size);
+		fwrite(generic_mem_buffer, 1, read_size, f);
+		executed_bytes += read_size;
+	}
+	unzCloseCurrentFile(src_file);
+	fclose(f);
+	f = fopen("ux0:data/gms/shared/tmp/tmp.droid", "rb+");
+	populateSoundsTable(f);
+	
+	unzGoToFirstFile(src_file);
+	zipFile dst_file = zipOpen(tmp_path, APPEND_STATUS_CREATE);
+	cur_idx = 0;
+	tot_idx = global_info.number_entry;
+	int extra_audiogroups = -1;
+	for (uint32_t zip_idx = 0; zip_idx < global_info.number_entry; ++zip_idx) {
+		unzGetCurrentFileInfo(src_file, &file_info, fname, 512, NULL, 0, NULL, 0);
+		if ((strstr(fname, "assets/") && fname[strlen(fname) - 1] != '/') || (strstr(fname, "res/raw") && fname[strlen(fname) - 1] != '/') || !strcmp(fname, "lib/armeabi-v7a/libyoyo.so") || !strcmp(fname, "lib/armeabi-v7a/libc++_shared.so")) {
+			if (strstr(fname, ".ogg") || strstr(fname, ".mp4")) {
+				zipOpenNewFileInZip(dst_file, fname, NULL, NULL, 0, NULL, 0, NULL, 0, Z_NO_COMPRESSION);
+			} else if (strstr(fname, "game.droid") || (strstr(fname, "audiogroup") && strstr(fname, ".dat"))) {
+				extra_audiogroups++;
+				unzGoToNextFile(src_file);
+				cur_idx++;
+				continue;
+			} else {
+				/*
+				 * HACK: There's some issue in zlib seemingly that makes zip_fread to fail after some reads on some specific files.
+				 * if they are compressed. Until a proper solution is found, we hack those files to be only stored to bypass the issue.
+				 */
+				bool needs_hack = false;
+				const char *blacklist[] = {
+					"english.ini", // AM2R
+					"yugothib.ttf" // JackQuest
+				};
+				for (int i = 0; i < (sizeof(blacklist) / sizeof(blacklist[0])); i++) {
+					if (strstr(fname, blacklist[i])) {
+						zipOpenNewFileInZip(dst_file, fname, NULL, NULL, 0, NULL, 0, NULL, 0, Z_NO_COMPRESSION);
+						needs_hack = true;
+						break;
+					}
+				}
+				if (!needs_hack)
+					zipOpenNewFileInZip(dst_file, fname, NULL, NULL, 0, NULL, 0, NULL, Z_DEFLATED, Z_DEFAULT_COMPRESSION);
+			}
+			executed_bytes = 0;
+			unzOpenCurrentFile(src_file);
+			if (isExternalizedSound(fname)) {
+				if (file_info.uncompressed_size > 10) { // Just to be sure we don't wipe legit music due to dummy data
+					sprintf(fname2, "ux0:data/gms/%s/%s", game, fname);
+					f = fopen(fname2, "wb+");
+					while (executed_bytes < file_info.uncompressed_size) {
+						uint32_t read_size = (file_info.uncompressed_size - executed_bytes) > MEM_BUFFER_SIZE ? MEM_BUFFER_SIZE : (file_info.uncompressed_size - executed_bytes);
+						unzReadCurrentFile(src_file, generic_mem_buffer, read_size);
+						fwrite(generic_mem_buffer, 1, read_size, f);
+						executed_bytes += read_size;
+					}
+					fclose(f);
+				}
+			} else {
+				if (!runner_loaded && strstr(fname, "libyoyo.so")) { // We may need the runner if the game has QOI textures
+					has_runner_extracted = 1;
+					FILE *y = fopen("ux0:data/gms/libyoyo.tmp", "wb+");
+					while (executed_bytes < file_info.uncompressed_size) {
+						uint32_t read_size = (file_info.uncompressed_size - executed_bytes) > MEM_BUFFER_SIZE ? MEM_BUFFER_SIZE : (file_info.uncompressed_size - executed_bytes);
+						unzReadCurrentFile(src_file, generic_mem_buffer, read_size);
+						fwrite(generic_mem_buffer, 1, read_size, y);
+						zipWriteInFileInZip(dst_file, generic_mem_buffer, read_size);
+						executed_bytes += read_size;
+					}
+					fclose(y);
+				} else {
+					while (executed_bytes < file_info.uncompressed_size) {
+						uint32_t read_size = (file_info.uncompressed_size - executed_bytes) > MEM_BUFFER_SIZE ? MEM_BUFFER_SIZE : (file_info.uncompressed_size - executed_bytes);
+						unzReadCurrentFile(src_file, generic_mem_buffer, read_size);
+						zipWriteInFileInZip(dst_file, generic_mem_buffer, read_size);
+						executed_bytes += read_size;
+					}
+				}
+			}
+			unzCloseCurrentFile(src_file);
+			zipCloseFileInZip(dst_file);
+		}
+		unzGoToNextFile(src_file);
+		cur_idx++;
+	}
+	
+	cur_step = 1;
+	f = fopen("ux0:data/gms/shared/tmp/tmp.droid", "rb+");
+	externalizeSoundsAndTextures(f, 0, dst_file, assets_path);
+	if (has_runner_extracted)
+		sceIoRemove("ux0:data/gms/libyoyo.tmp");
+	f = fopen("ux0:data/gms/shared/tmp/tmp.droid", "rb");
+	FILE *f2 = fopen("ux0:data/gms/shared/tmp/tmp2.droid", "wb+");
+	patchForExternalization(f, f2);
+	sceIoRemove("ux0:data/gms/shared/tmp/tmp.droid");
+	f2 = fopen("ux0:data/gms/shared/tmp/tmp2.droid", "rb");
+	fseek(f2, 0, SEEK_END);
+	uint32_t uncompressed_size = ftell(f2);
+	fseek(f2, 0, SEEK_SET);
+	zipOpenNewFileInZip(dst_file, "assets/game.droid", NULL, NULL, 0, NULL, 0, NULL, Z_DEFLATED, Z_DEFAULT_COMPRESSION);
+	executed_bytes = 0;
+	while (executed_bytes < uncompressed_size) {
+		uint32_t read_size = (uncompressed_size - executed_bytes) > MEM_BUFFER_SIZE ? MEM_BUFFER_SIZE : (uncompressed_size - executed_bytes);
+		fread(generic_mem_buffer, 1, read_size, f2);
+		zipWriteInFileInZip(dst_file, generic_mem_buffer, read_size);
+		executed_bytes += read_size;
+	}
+	zipCloseFileInZip(dst_file);
+	fclose(f2);
+	sceIoRemove("ux0:data/gms/shared/tmp/tmp2.droid");
+	
+	for (int i = 1; i <= extra_audiogroups; i++) {
+		cur_step++;
+		sprintf(fname, "assets/audiogroup%d.dat", i);
+		unzLocateFile(src_file, fname, NULL);
+		unzGetCurrentFileInfo(src_file, &file_info, fname, 512, NULL, 0, NULL, 0);
+		unzOpenCurrentFile(src_file);
+		sprintf(fname, "ux0:data/gms/shared/tmp/audiogroup%d.tmp", i);
+		FILE *f = fopen(fname, "wb");
+		executed_bytes = 0;
+		while (executed_bytes < file_info.uncompressed_size) {
+			uint32_t read_size = (file_info.uncompressed_size - executed_bytes) > MEM_BUFFER_SIZE ? MEM_BUFFER_SIZE : (file_info.uncompressed_size - executed_bytes);
+			unzReadCurrentFile(src_file, generic_mem_buffer, read_size);
+			fwrite(generic_mem_buffer, 1, read_size, f);
+			executed_bytes += read_size;
+		}
+		unzCloseCurrentFile(src_file);
+		fclose(f);
+		f = fopen(fname, "rb");
+		externalizeSoundsAndTextures(f, i, dst_file, assets_path);
+		f = fopen(fname, "rb");
+		sprintf(fname2, "ux0:data/gms/shared/tmp/_audiogroup%d.tmp", i);
+		f2 = fopen(fname2, "wb+");
+		patchForExternalization(f, f2);
+		
+		sceIoRemove(fname);
+		f2 = fopen(fname2, "rb");
+		fseek(f2, 0, SEEK_END);
+		uint32_t uncompressed_size = ftell(f2);
+		fseek(f2, 0, SEEK_SET);
+		sprintf(fname, "assets/audiogroup%d.dat", i);
+		zipOpenNewFileInZip(dst_file, fname, NULL, NULL, 0, NULL, 0, NULL, Z_DEFLATED, Z_DEFAULT_COMPRESSION);
+		executed_bytes = 0;
+		while (executed_bytes < uncompressed_size) {
+			uint32_t read_size = (uncompressed_size - executed_bytes) > MEM_BUFFER_SIZE ? MEM_BUFFER_SIZE : (uncompressed_size - executed_bytes);
+			fread(generic_mem_buffer, 1, read_size, f2);
+			zipWriteInFileInZip(dst_file, generic_mem_buffer, read_size);
+			executed_bytes += read_size;
+		}
+		zipCloseFileInZip(dst_file);
+		fclose(f2);
+		sceIoRemove(fname2);
+	}
+	
+	unzClose(src_file);
+	zipClose(dst_file, NULL);
+	sceIoRemove(apk_path);
+	sceIoRename(tmp_path, apk_path);
+	
+	sceIoGetstat(apk_path, &stat);
+	saved_size = (float)(orig_size - stat.st_size) / (1024.0f * 1024.0f);
+	return sceKernelExitDeleteThread(0);
+}
+
 static int compatListThread(unsigned int args, void *arg) {
 	char url[512], dbname[64];
 	curl_handle = curl_easy_init();
@@ -507,6 +1145,15 @@ void OptimizeApk(char *game) {
 	extracting = true;
 	SceUID optimizer_thid = sceKernelCreateThread("Optimizer Thread", &optimizer_thread, 0x10000100, 0x100000, 0, 0, NULL);
 	sceKernelStartThread(optimizer_thid, strlen(game) + 1, game);
+}
+
+void ExternalizeApk(char *game) {
+	tot_idx = -1;
+	saved_size = -1.0f;
+	extracting = true;
+	externalizing = true;
+	SceUID externalizer_thid = sceKernelCreateThread("Externalizer Thread", &externalizer_thread, 0x10000100, 0x800000, 0, 0, NULL);
+	sceKernelStartThread(externalizer_thid, strlen(game) + 1, game);
 }
 
 static int updaterThread(unsigned int args, void *arg) {
@@ -625,19 +1272,6 @@ static int animBannerThread(unsigned int args, void *arg) {
 }
 
 static char fname[512], ext_fname[512], read_buffer[8192];
-
-void recursive_mkdir(char *dir) {
-	char *p = dir;
-	while (p) {
-		char *p2 = strstr(p, "/");
-		if (p2) {
-			p2[0] = 0;
-			sceIoMkdir(dir, 0777);
-			p = p2 + 1;
-			p2[0] = '/';
-		} else break;
-	}
-}
 
 void extract_file(char *file, char *dir) {
 	unz_global_info global_info;
@@ -774,8 +1408,22 @@ void setTranslation(int idx) {
 		sprintf(langFile, "app0:lang/Japanese.ini");
 		needs_extended_font = true;
 		break;
+	case SCE_SYSTEM_PARAM_LANG_CHINESE_S:
+		sprintf(langFile, "app0:lang/Chinese_Simplified.ini");
+		needs_extended_font = true;
+		break;
+	case SCE_SYSTEM_PARAM_LANG_CHINESE_T:
+		sprintf(langFile, "app0:lang/Chinese_Traditional.ini");
+		needs_extended_font = true;
+		break;
 	case SCE_SYSTEM_PARAM_LANG_UKRAINIAN:
 		sprintf(langFile, "app0:lang/Ukrainian.ini");
+		break;
+	case SCE_SYSTEM_PARAM_LANG_RYUKYUAN:
+		sprintf(langFile, "app0:lang/Ryukyuan.ini");
+		break;
+	case SCE_SYSTEM_PARAM_LANG_CZECH:
+		sprintf(langFile, "app0:lang/Czech.ini");
 		break;
 	default:
 		sprintf(langFile, "app0:lang/English.ini");
@@ -843,7 +1491,16 @@ void setImguiTheme() {
 	ImGui::GetIO().MouseDrawCursor = false;
 }
 
+#define PLATFORM_NUM 3
+const char *PlatformName[PLATFORM_NUM] = {
+	"Android",
+	"Windows",
+	"PS4"
+};
+
 int main(int argc, char *argv[]) {
+	gl_mutex = sceKernelCreateSema("GL Mutex", 0, 1, 1, NULL);
+	
 	sceSysmoduleLoadModule(SCE_SYSMODULE_AVPLAYER);
 	
 	sceIoMkdir("ux0:data/gms", 0777);
@@ -884,7 +1541,8 @@ int main(int argc, char *argv[]) {
 	}
 	
 	GameSelection *hovered = nullptr;
-	vglInitExtended(0, 960, 544, 0x1800000, SCE_GXM_MULTISAMPLE_4X);
+	vglInitExtended(0, 960, 544, 0x1800000, SCE_GXM_MULTISAMPLE_NONE);
+	
 	ImGui::CreateContext();
 	SceKernelThreadInfo info;
 	info.size = sizeof(SceKernelThreadInfo);
@@ -940,11 +1598,21 @@ int main(int argc, char *argv[]) {
 	
 	ImGui_ImplVitaGL_TouchUsage(false);
 	ImGui_ImplVitaGL_GamepadUsage(true);
+	ImGui_ImplVitaGL_MouseStickUsage(false);
 	setImguiTheme();
 	FILE *f;
 	
-	// Check if YoYo Loader has been launched with a custom bubble
+	// Check if user wants to skip updates
 	bool skip_updates_check = strstr(stringify(GIT_VERSION), "dirty") != nullptr;
+	bool skip_compat_update = false;
+	SceCtrlData pad;
+	sceCtrlPeekBufferPositive(0, &pad, 1);
+	if ((pad.buttons & SCE_CTRL_LTRIGGER) && (pad.buttons & SCE_CTRL_RTRIGGER)) {
+		skip_updates_check = true;
+		skip_compat_update = true;
+	}
+	
+	// Check if YoYo Loader has been launched with a custom bubble
 	char boot_params[1024];
 	sceAppMgrGetAppParam(boot_params);
 	if (strstr(boot_params,"psgm:play") && strstr(boot_params, "&param=")) {
@@ -988,7 +1656,6 @@ int main(int argc, char *argv[]) {
 	}
 	
 	// Downloading compatibility list
-	bool skip_compat_update = false;
 	if  (!skip_compat_update) {
 		SceUID thd = sceKernelCreateThread("Compat List Updater", &compatListThread, 0x10000100, 0x100000, 0, 0, NULL);
 		sceKernelStartThread(thd, 0, NULL);
@@ -1035,7 +1702,9 @@ int main(int argc, char *argv[]) {
 				unzReadCurrentFile(apk_file, generic_mem_buffer, target);
 				unzReadCurrentFile(apk_file, &offs, 4);
 				unzReadCurrentFile(apk_file, g->game_id, offs + 1);
-				if (!strcmp(g->game_id, "Runner")) {
+				if (!strcmp(g->game_id, "Runner")
+				 || !strcasecmp(g->game_id, "gbjam4") 
+				 || !strcmp(g->game_id, "lucid-dream-pc")) {
 					unzReadCurrentFile(apk_file, &offs, 4);
 					unzReadCurrentFile(apk_file, generic_mem_buffer, offs + 1);
 					unzReadCurrentFile(apk_file, &offs, 4);
@@ -1057,7 +1726,14 @@ int main(int argc, char *argv[]) {
 	}
 	sceIoDclose(fd);
 	
+	bool fast_increment = false;
+	bool fast_decrement = false;
+	GameSelection *decrement_stack[4096];
+	GameSelection *decremented_app = nullptr;
+	int decrement_stack_idx = 0;
 	while (!launch_item) {
+		sceKernelWaitSema(gl_mutex, 1, NULL);
+		
 		if (old_sort_idx != sort_idx) {
 			old_sort_idx = sort_idx;
 			sort_gamelist(games);
@@ -1101,6 +1777,8 @@ int main(int argc, char *argv[]) {
 
 		ImVec2 config_pos;
 		GameSelection *g = games;
+		int increment_idx = 0;
+		bool is_app_hovered = false;
 		while (g) {
 			if (filter_idx != FILTER_DISABLED && filterGames(g)) {
 				g = g->next;
@@ -1111,12 +1789,37 @@ int main(int argc, char *argv[]) {
 			}
 			if (ImGui::IsItemHovered()) {
 				hovered = g;
+				is_app_hovered = true;
+				if (fast_increment)
+					increment_idx = 1;
+				else if (fast_decrement) {
+					if (decrement_stack_idx == 0)
+						fast_decrement = false;
+					else
+						decremented_app = decrement_stack[decrement_stack_idx >= 20 ? (decrement_stack_idx - 20) : 0];
+				}
+			} else if (increment_idx) {
+				increment_idx++;
+				ImGui::GetCurrentContext()->NavId = ImGui::GetCurrentContext()->CurrentWindow->DC.LastItemId;
+				ImGui::SetScrollHere();
+				if (increment_idx == 21 || g->next == NULL)
+					increment_idx = 0;
+			} else if (fast_decrement) {
+				if (!decremented_app)
+					decrement_stack[decrement_stack_idx++] = g;
+				else if (decremented_app == g) {
+					ImGui::GetCurrentContext()->NavId = ImGui::GetCurrentContext()->CurrentWindow->DC.LastItemId;
+					ImGui::SetScrollHere();
+					fast_decrement = false;
+				}	
 			}
 			g = g->next;
 		}
+		if (!is_app_hovered)
+			fast_decrement = false;
+		fast_increment = false;
 		ImGui::End();
 		
-		SceCtrlData pad;
 		sceCtrlPeekBufferPositive(0, &pad, 1);
 		if (pad.buttons & SCE_CTRL_TRIANGLE && !(oldpad & SCE_CTRL_TRIANGLE) && hovered && !extracting && !is_downloading_banners && !is_downloading_anim_banner) {
 			is_config_invoked = !is_config_invoked;
@@ -1136,6 +1839,12 @@ int main(int argc, char *argv[]) {
 			video_close();
 			animated_preview_delayer = ANIMATED_PREVIEW_DELAY;
 			anim_download_request = true;
+		} else if ((pad.buttons & SCE_CTRL_LEFT && !(oldpad & SCE_CTRL_LEFT)) && !is_config_invoked) {
+			fast_decrement = true;
+			decrement_stack_idx = 0;
+			decremented_app = nullptr;
+		} else if ((pad.buttons & SCE_CTRL_RIGHT && !(oldpad & SCE_CTRL_RIGHT)) && !is_config_invoked) {
+			fast_increment = true;
 		}
 		oldpad = pad.buttons;
 		
@@ -1174,9 +1883,23 @@ int main(int argc, char *argv[]) {
 			ImGui::Checkbox(lang_strings[STR_GLES1], &hovered->gles1);
 			if (ImGui::IsItemHovered())
 				desc = lang_strings[STR_GLES1_DESC];
-			ImGui::Checkbox(lang_strings[STR_FAKE_WIN], &hovered->fake_win_mode);
+			ImGui::PushItemWidth(100.0f);
+			if (ImGui::BeginCombo(lang_strings[STR_PLAT_TARGET], PlatformName[hovered->plat_target])) {
+				for (int n = 0; n < PLATFORM_NUM; n++) {
+					bool is_selected = hovered->plat_target == n;
+					if (ImGui::Selectable(PlatformName[n], is_selected))
+						hovered->plat_target = n;
+					if (ImGui::IsItemHovered())
+						desc = lang_strings[STR_PLAT_TARGET_DESC];
+					if (is_selected)
+						ImGui::SetItemDefaultFocus();
+				}
+				ImGui::EndCombo();
+			}
+			ImGui::PopItemWidth();
+			ImGui::Checkbox(lang_strings[STR_UNCACHED_MEM], &hovered->uncached_mem);
 			if (ImGui::IsItemHovered())
-				desc = lang_strings[STR_FAKE_WIN_DESC];
+				desc = lang_strings[STR_UNCACHED_MEM_DESC];
 			ImGui::Checkbox(lang_strings[STR_EXTRA_MEM], &hovered->mem_extended);
 			if (ImGui::IsItemHovered())
 				desc = lang_strings[STR_EXTRA_MEM_DESC];
@@ -1186,19 +1909,22 @@ int main(int argc, char *argv[]) {
 			ImGui::Checkbox(lang_strings[STR_SQUEEZE], &hovered->squeeze_mem);
 			if (ImGui::IsItemHovered())
 				desc = lang_strings[STR_SQUEEZE_DESC];
+			ImGui::Checkbox(lang_strings[STR_DOUBLE_BUFFERING], &hovered->double_buffering);
+			if (ImGui::IsItemHovered())
+				desc = lang_strings[STR_DOUBLE_BUFFERING_DESC];
 			ImGui::Checkbox(lang_strings[STR_VIDEO_PLAYER], &hovered->video_support);
 			if (ImGui::IsItemHovered())
 				desc = lang_strings[STR_VIDEO_PLAYER_DESC];
 			ImGui::Checkbox(lang_strings[STR_NETWORK], &hovered->has_net);
 			if (ImGui::IsItemHovered())
 				desc = lang_strings[STR_NETWORK_DESC];
+			ImGui::Checkbox(lang_strings[STR_AUDIO], &hovered->no_audio);
+			if (ImGui::IsItemHovered())
+				desc = lang_strings[STR_AUDIO_DESC];
 			ImGui::Separator();
 			ImGui::Checkbox(lang_strings[STR_BILINEAR], &hovered->bilinear);
 			if (ImGui::IsItemHovered())
 				desc = lang_strings[STR_BILINEAR_DESC];
-			ImGui::Checkbox(lang_strings[STR_COMPRESS], &hovered->compress_textures);
-			if (ImGui::IsItemHovered())
-				desc = lang_strings[STR_COMPRESS_DESC];
 			ImGui::Separator();
 			ImGui::Checkbox(lang_strings[STR_SPLASH_SKIP], &hovered->skip_splash);
 			if (ImGui::IsItemHovered())
@@ -1217,6 +1943,21 @@ int main(int argc, char *argv[]) {
 			}
 			if (ImGui::IsItemHovered())
 				desc = lang_strings[STR_OPTIMIZE_DESC];
+			ImGui::SameLine();
+			ImGui::Text("   ");
+			ImGui::SameLine();
+			if (ImGui::Button(lang_strings[STR_EXTERNALIZE])) {
+				if (!extracting)
+					ExternalizeApk(hovered->name);
+			}
+			if (ImGui::IsItemHovered())
+				desc = lang_strings[STR_EXTERNALIZE_DESC];
+			ImGui::SameLine();
+			ImGui::Text("   ");
+			ImGui::SameLine();
+			ImGui::Checkbox(lang_strings[STR_COMPRESS], (bool *)&has_pvr);
+			if (ImGui::IsItemHovered())
+				desc = lang_strings[STR_COMPRESS_DESC];
 			if (saved_size != -1.0f) {
 				ImGui::Text(" ");
 				ImGui::Text(lang_strings[STR_OPTIMIZE_END]);
@@ -1224,9 +1965,24 @@ int main(int argc, char *argv[]) {
 				if (extracting)
 					hovered->size -= saved_size;
 				extracting = false;
+				externalizing = false;
 			} else if (extracting) {
+				sceKernelPowerTick(SCE_KERNEL_POWER_TICK_DEFAULT);
 				ImGui::Text(" ");
-				ImGui::Text(lang_strings[STR_OPTIMIZATION]);
+				if (externalizing) {
+					switch (cur_step) {
+					case 0:
+						ImGui::Text(lang_strings[STR_OPTIMIZATION]);
+						break;
+					case 1:
+						ImGui::Text(lang_strings[STR_EXTERNALIZE_DROID]);
+						break;
+					default:
+						ImGui::Text("%s (%d)...", lang_strings[STR_EXTERNALIZE_AUDIOGROUP], cur_step - 1);
+						break;
+					}
+				} else
+					ImGui::Text(lang_strings[STR_OPTIMIZATION]);
 				if (tot_idx > 0)
 					ImGui::ProgressBar((float)cur_idx / float(tot_idx), ImVec2(200, 0));
 				else
@@ -1281,15 +2037,17 @@ int main(int argc, char *argv[]) {
 			}
 			ImGui::Separator();
 			ImGui::Text("%s: %s", lang_strings[STR_GLES1], hovered->gles1 ? lang_strings[STR_YES] : lang_strings[STR_NO]);
-			ImGui::Text("%s: %s", lang_strings[STR_FAKE_WIN], hovered->fake_win_mode ? lang_strings[STR_YES] : lang_strings[STR_NO]);
+			ImGui::Text("%s: %s", lang_strings[STR_PLAT_TARGET], PlatformName[hovered->plat_target]);
+			ImGui::Text("%s: %s", lang_strings[STR_UNCACHED_MEM], hovered->uncached_mem ? lang_strings[STR_YES] : lang_strings[STR_NO]);
 			ImGui::Text("%s: %s", lang_strings[STR_EXTRA_MEM], hovered->mem_extended ? lang_strings[STR_YES] : lang_strings[STR_NO]);
 			ImGui::Text("%s: %s", lang_strings[STR_EXTRA_POOL], hovered->newlib_extended ? lang_strings[STR_YES] : lang_strings[STR_NO]);
 			ImGui::Text("%s: %s", lang_strings[STR_SQUEEZE], hovered->squeeze_mem ? lang_strings[STR_YES] : lang_strings[STR_NO]);
+			ImGui::Text("%s: %s", lang_strings[STR_DOUBLE_BUFFERING], hovered->double_buffering ? lang_strings[STR_YES] : lang_strings[STR_NO]);
 			ImGui::Text("%s: %s", lang_strings[STR_VIDEO_PLAYER], hovered->video_support ? lang_strings[STR_YES] : lang_strings[STR_NO]);
 			ImGui::Text("%s: %s", lang_strings[STR_NETWORK], hovered->has_net ? lang_strings[STR_YES] : lang_strings[STR_NO]);
+			ImGui::Text("%s: %s", lang_strings[STR_AUDIO], hovered->no_audio ? lang_strings[STR_YES] : lang_strings[STR_NO]);
 			ImGui::Separator();
 			ImGui::Text("%s: %s", lang_strings[STR_BILINEAR], hovered->bilinear ? lang_strings[STR_YES] : lang_strings[STR_NO]);
-			ImGui::Text("%s: %s", lang_strings[STR_COMPRESS], hovered->compress_textures ? lang_strings[STR_YES] : lang_strings[STR_NO]);
 			ImGui::Separator();
 			ImGui::Text("%s: %s", lang_strings[STR_SPLASH_SKIP], hovered->skip_splash ? lang_strings[STR_YES] : lang_strings[STR_NO]);
 			ImGui::Separator();
@@ -1308,6 +2066,7 @@ int main(int argc, char *argv[]) {
 		ImGui::Render();
 		ImGui_ImplVitaGL_RenderDrawData(ImGui::GetDrawData());
 		vglSwapBuffers(GL_FALSE);
+		sceKernelSignalSema(gl_mutex, 1);
 	}
 
 	f = fopen(LAUNCH_FILE_PATH, "w+");
@@ -1320,8 +2079,7 @@ int main(int argc, char *argv[]) {
 	fprintf(f, "%s=%d\n", "forceGLES1", (int)hovered->gles1);
 	fprintf(f, "%s=%d\n", "noSplash", (int)hovered->skip_splash);
 	fprintf(f, "%s=%d\n", "forceBilinear", (int)hovered->bilinear);
-	fprintf(f, "%s=%d\n", "winMode", (int)hovered->fake_win_mode);
-	fprintf(f, "%s=%d\n", "compressTextures", (int)hovered->compress_textures);
+	fprintf(f, "%s=%d\n", "platTarget", hovered->plat_target);
 	fprintf(f, "%s=%d\n", "debugMode", (int)hovered->debug_mode);
 	fprintf(f, "%s=%d\n", "debugShaders", (int)hovered->debug_shaders);
 	fprintf(f, "%s=%d\n", "maximizeMem", (int)hovered->mem_extended);
@@ -1329,6 +2087,9 @@ int main(int argc, char *argv[]) {
 	fprintf(f, "%s=%d\n", "videoSupport", (int)hovered->video_support);
 	fprintf(f, "%s=%d\n", "netSupport", (int)hovered->has_net);
 	fprintf(f, "%s=%d\n", "squeezeMem", (int)hovered->squeeze_mem);
+	fprintf(f, "%s=%d\n", "disableAudio", (int)hovered->no_audio);
+	fprintf(f, "%s=%d\n", "uncachedMem", (int)hovered->uncached_mem);
+	fprintf(f, "%s=%d\n", "doubleBuffering", (int)hovered->double_buffering);
 	fclose(f);
 	
 	sprintf(config_path, "ux0:data/gms/shared/yyl.cfg");
@@ -1340,6 +2101,11 @@ int main(int argc, char *argv[]) {
 	sprintf(config_path, "ux0:data/gms/%s/keys.ini", launch_item);
 	SceIoStat stat;
 	if (hovered && sceIoGetstat(config_path, &stat)) {
+		char *p = strstr(hovered->game_id, ":");
+		while (p) {
+			p[0] = '_';
+			p = strstr(p, ":");
+		}
 		char url[512], final_url[512] = "";
 		curl_handle = curl_easy_init();
 		sprintf(url, "https://github.com/Rinnegatamante/yoyoloader_vita/blob/main/keymaps/%s.ini?raw=true", hovered->game_id);
